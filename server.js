@@ -256,7 +256,8 @@ function dbRowWork(w) {
     form: w.form || '', tags: w.tags || '', highlight: w.highlight || '',
     description: w.desc || '', manifesto: w.manifesto || '',
     link: w.link || null, social: w.social || null,
-    platform: w.platform || '', shots: w.shots || []
+    platform: w.platform || '', shots: w.shots || [],
+    is_authorized: !!w.authorization, wall_status: w.wallStatus || ''
   };
 }
 function dbRowSubmission(r) {
@@ -265,8 +266,9 @@ function dbRowSubmission(r) {
     form: r.form || '', status: r.status || '未知', submitted_at: r.submittedAt || '',
     reviewed_at: r.reviewedAt || '', reject_reason: r.rejectReason || '',
     highlight: r.highlight || '', manifesto: r.manifesto || '', description: r.desc || '',
-    link: r.link || null, shots: r.shots || [], tags: r.tags || '',
-    card_no: r.cardNo == null ? null : r.cardNo, platform: r.platform || ''
+    link: r.link || null, social: r.social || null, shots: r.shots || [], tags: r.tags || '',
+    card_no: r.cardNo == null ? null : r.cardNo, platform: r.platform || '',
+    is_authorized: !!r.authorization
   };
 }
 function dbRowToWork(row) {
@@ -275,7 +277,8 @@ function dbRowToWork(row) {
     form: row.form || '', tags: row.tags || '', highlight: row.highlight || '',
     desc: row.description || '', manifesto: row.manifesto || '',
     link: row.link || null, social: row.social || null,
-    platform: row.platform || '', shots: row.shots || []
+    platform: row.platform || '', shots: row.shots || [],
+    authorization: !!row.is_authorized, wallStatus: row.wall_status || ''
   };
 }
 function dbRowToSubmission(row) {
@@ -284,8 +287,9 @@ function dbRowToSubmission(row) {
     form: row.form || '', status: row.status || '未知', submittedAt: row.submitted_at || '',
     reviewedAt: row.reviewed_at || '', rejectReason: row.reject_reason || '',
     highlight: row.highlight || '', manifesto: row.manifesto || '', desc: row.description || '',
-    link: row.link || null, shots: row.shots || [], tags: row.tags || '',
-    cardNo: row.card_no == null ? null : row.card_no, platform: row.platform || ''
+    link: row.link || null, social: row.social || null, shots: row.shots || [], tags: row.tags || '',
+    cardNo: row.card_no == null ? null : row.card_no, platform: row.platform || '',
+    authorization: !!row.is_authorized
   };
 }
 
@@ -350,10 +354,13 @@ function mapWork(r) {
     link: firstLink(r['体验链接']),
     social: firstLink(r['社媒分享链接']),
     platform: r['上传平台'] || '',
+    authorization: r['参赛授权'] === true,
+    wallStatus: r['状态'] || '',
     shots: (Array.isArray(r['作品截图']) ? r['作品截图'] : []).map((s) => ({
       url: s.imageUrl || '',
       title: s.title || ''
     }))
+    /* 注：原始记录还有 UserID（个人身份标识，隐私边界不采集）与 图片数（= shots.length 可推导，不重复存） */
   };
 }
 
@@ -417,6 +424,8 @@ function richPool(r) {
     submittedAt: r['提交时间'] || '',
     reviewedAt: r['审核时间'] || '',
     rejectReason: r['驳回原因'] || '',
+    authorization: r['参赛授权'] === true,
+    social: Array.isArray(r['社媒分享链接']) ? r['社媒分享链接'] : null,
     highlight: r['一句话亮点'] || '',
     manifesto: r['我的作品宣言'] || '',
     desc: r['原文描述'] || '',
@@ -504,7 +513,7 @@ function scheduleDbSync(table, memRows, toDbRow) {
 async function hydrateFromDb() {
   try {
     const works = await dbSelectAll('works',
-      ['id', 'card_no', 'name', 'author', 'form', 'tags', 'highlight', 'description', 'manifesto', 'link', 'social', 'platform', 'shots']);
+      ['id', 'card_no', 'name', 'author', 'form', 'tags', 'highlight', 'description', 'manifesto', 'link', 'social', 'platform', 'shots', 'is_authorized', 'wall_status']);
     if (works.length) {
       const byId = {};
       works.forEach((row) => {
@@ -517,7 +526,7 @@ async function hydrateFromDb() {
       log('云库 hydration 作品:', works.length, '条，内存合计:', state.worksFull.length);
     }
     const subs = await dbSelectAll('submissions',
-      ['id', 'sid', 'name', 'author', 'form', 'status', 'submitted_at', 'reviewed_at', 'reject_reason', 'highlight', 'manifesto', 'description', 'link', 'shots', 'tags', 'card_no', 'platform']);
+      ['id', 'sid', 'name', 'author', 'form', 'status', 'submitted_at', 'reviewed_at', 'reject_reason', 'highlight', 'manifesto', 'description', 'link', 'social', 'shots', 'tags', 'card_no', 'platform', 'is_authorized']);
     if (subs.length) {
       subs.forEach((row) => {
         const r = dbRowToSubmission(row);
