@@ -456,7 +456,7 @@
     works: { title: '作品库', desc: '已上架作品全表 · 搜索筛选排序 · 点击行查看 AI 画像', render: renderWorksPage },
     ratings: { title: 'AI 评审', desc: '按官方评分细则生成的模拟评审排行（非官方结果）', render: renderRatingsPage },
     insights: { title: '数据洞察', desc: '投稿趋势 · 审核结构 · 形态与平台分布 · AI 评分分布', render: renderInsightsPage },
-    feed: { title: '实时动态', desc: '投稿池最新提交流水', render: renderFeedPage },
+    feed: { title: '实时动态', desc: '投稿池全量流水 · 分页浏览 · 状态筛选', render: renderFeedPage },
     about: { title: '关于', desc: '数据来源 · 隐私声明 · 风险提示', render: renderAboutPage }
   };
 
@@ -509,7 +509,7 @@
     else if (route === 'works') { fetchWorksPage(true); }
     else if (route === 'ratings') { renderRatingsMeta(); renderRatingsList(); }
     else if (route === 'insights') { renderCharts(); renderBreakdown(); renderHistogram(); renderPopularity(); }
-    else if (route === 'feed') { renderStream(); }
+    else if (route === 'feed') { fetchFeedPage(); }
     updateAiBadge();
   }
 
@@ -1304,42 +1304,90 @@
   }
 
   // ============================================================ 页面：实时动态
-  var feedFilter = ''; /* 动态页状态筛选：'' 全部 / 待审核 / 已通过 / 已驳回 */
+  var feedFilter = '';      /* 动态页状态筛选：'' 全部 / 待审核 / 已通过 / 已驳回 */
+  var feedPage = 1;         /* 当前页码 */
+  var feedPerPage = 50;     /* 每页条数 */
+  var feedReqSeq = 0;       /* 请求序号，防乱序覆盖 */
+  var feedRowCache = {};    /* 当前页行缓存 id -> 行对象（点击详情用） */
+
   function renderFeedPage() {
     $('page').innerHTML =
       '<div class="panel">' +
-      '<div class="panel-h"><h2>最新投稿流水</h2><div class="rule"></div>' +
+      '<div class="panel-h"><h2>投稿流水</h2><div class="rule"></div>' +
       '<span class="feed-tabs" id="feedTabs">' +
         '<button class="feed-tab on" data-fst="">全部</button>' +
         '<button class="feed-tab" data-fst="待审核">待审核</button>' +
         '<button class="feed-tab" data-fst="已通过">已通过</button>' +
         '<button class="feed-tab" data-fst="已驳回">已驳回</button>' +
       '</span></div>' +
-      '<ul class="stream" id="recentStream"></ul></div>';
-    renderStream();
+      '<ul class="stream" id="recentStream"></ul>' +
+      '<div class="table-foot"><span id="feedShown">–</span><div class="pager" id="feedPager"></div></div></div>';
+    feedPage = 1;
+    fetchFeedPage();
   }
 
-  function renderStream() {
+  function fetchFeedPage() {
+    var seq = ++feedReqSeq;
+    apiGet('/api/submissions', { page: feedPage, per: feedPerPage, status: feedFilter }).then(function (res) {
+      if (seq !== feedReqSeq || route !== 'feed') return; /* 过期响应丢弃 */
+      var pages = res.pages || 1;
+      if (feedPage > pages) { feedPage = pages; fetchFeedPage(); return; }
+      paintFeed(res);
+    }).catch(function () {
+      /* 服务暂不可用：退回快照里的最新流水 */
+      var el = $('recentStream');
+      if (el) el.innerHTML = '<li style="cursor:default;color:var(--muted)">投稿流水加载失败，稍后自动重试</li>';
+    });
+  }
+
+  function paintFeed(res) {
     var el = $('recentStream');
     if (!el) return;
-    var all = snapshot.recentSubmissions || [];
-    var list = feedFilter ? all.filter(function (r) { return r.status === feedFilter; }) : all;
+    var list = res.submissions || [];
+    feedRowCache = {};
+    list.forEach(function (r) { feedRowCache[r.id] = r; });
     var statusMap = { '待审核': 'st-pending', '已通过': 'st-approved', '已驳回': 'st-rejected' };
     var tabs = document.querySelectorAll('#feedTabs .feed-tab');
     for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('on', tabs[i].getAttribute('data-fst') === feedFilter);
     if (!list.length) {
-      el.innerHTML = '<li style="cursor:default;color:var(--muted)">' + (all.length ? '该状态下暂无记录' : '投稿流水采集中…') + '</li>';
-      return;
+      el.innerHTML = '<li style="cursor:default;color:var(--muted)">该条件下暂无记录（数据采集中…）</li>';
+    } else {
+      el.innerHTML = list.map(function (r) {
+        var t = (r.submittedAt || '').slice(5);
+        return '<li data-feed="' + esc(r.id || '') + '">' +
+          '<span class="s-time">' + esc(t) + '</span>' +
+          '<span class="s-name">' + esc(r.name) + (r.highlight ? '<span class="hl">' + esc(r.highlight) + '</span>' : '') + '</span>' +
+          '<span class="s-author">@' + esc(r.author) + '</span>' +
+          '<span class="s-st"><span class="chip ' + (statusMap[r.status] || '') + '">' + esc(r.status) + '</span></span>' +
+          '</li>';
+      }).join('');
     }
-    el.innerHTML = list.map(function (r) {
-      var t = (r.submittedAt || '').slice(5);
-      return '<li data-feed="' + esc(r.id || '') + '">' +
-        '<span class="s-time">' + esc(t) + '</span>' +
-        '<span class="s-name">' + esc(r.name) + (r.highlight ? '<span class="hl">' + esc(r.highlight) + '</span>' : '') + '</span>' +
-        '<span class="s-author">@' + esc(r.author) + '</span>' +
-        '<span class="s-st"><span class="chip ' + (statusMap[r.status] || '') + '">' + esc(r.status) + '</span></span>' +
-        '</li>';
-    }).join('');
+    var shown = $('feedShown');
+    if (shown) shown.textContent = '共 ' + res.total + ' 条 · 第 ' + res.page + '/' + res.pages + ' 页';
+    renderFeedPager(res);
+  }
+
+  /* 投稿池页码器（复用作品库样式） */
+  function renderFeedPager(res) {
+    var el = $('feedPager');
+    if (!el) return;
+    var pages = res.pages || 1;
+    var p = Math.min(feedPage, pages);
+    var html = '<button class="pg-btn" data-fpg="1"' + (p <= 1 ? ' disabled' : '') + '>首页</button>' +
+      '<button class="pg-btn" data-fpg="' + (p - 1) + '"' + (p <= 1 ? ' disabled' : '') + '>上一页</button>';
+    var nums = [];
+    for (var i = 1; i <= pages; i++) {
+      if (i === 1 || i === pages || Math.abs(i - p) <= 1) nums.push(i);
+    }
+    var last = 0;
+    nums.forEach(function (n) {
+      if (n - last > 1) html += '<span class="pg-ell">…</span>';
+      html += '<button class="pg-btn' + (n === p ? ' on' : '') + '" data-fpg="' + n + '">' + n + '</button>';
+      last = n;
+    });
+    html += '<button class="pg-btn" data-fpg="' + (p + 1) + '"' + (p >= pages ? ' disabled' : '') + '>下一页</button>' +
+      '<button class="pg-btn" data-fpg="' + pages + '"' + (p >= pages ? ' disabled' : '') + '>末页 ' + pages + '</button>';
+    el.innerHTML = html;
   }
 
   // ============================================================ 页面：关于
@@ -1757,8 +1805,8 @@
     var feedEl = t.closest('[data-feed]');
     if (feedEl) {
       var fid = feedEl.getAttribute('data-feed');
-      var sub = null;
-      (snapshot.recentSubmissions || []).forEach(function (r) { if (r.id === fid) sub = r; });
+      var sub = feedRowCache[fid] || null;
+      if (!sub) (snapshot.recentSubmissions || []).forEach(function (r) { if (r.id === fid) sub = r; });
       if (sub) {
         if (sub.cardNo != null) {
           var fw = null;
@@ -1769,9 +1817,16 @@
       }
       return;
     }
+    /* 投稿池页码器 */
+    var fpgEl = t.closest('.pg-btn[data-fpg]');
+    if (fpgEl && !fpgEl.disabled) {
+      var fp = parseInt(fpgEl.getAttribute('data-fpg'), 10);
+      if (fp >= 1 && fp !== feedPage) { feedPage = fp; fetchFeedPage(); window.scrollTo(0, 0); }
+      return;
+    }
     /* 投稿流水状态筛选 */
     var fstEl = t.closest('[data-fst]');
-    if (fstEl) { feedFilter = fstEl.getAttribute('data-fst'); renderStream(); return; }
+    if (fstEl) { feedFilter = fstEl.getAttribute('data-fst'); feedPage = 1; fetchFeedPage(); return; }
     var opener = t.closest('[data-open]');
     if (opener) {
       var oid = opener.getAttribute('data-open');

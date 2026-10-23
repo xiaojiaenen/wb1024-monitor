@@ -61,6 +61,16 @@ const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const WORKS_FULL_FILE = path.join(DATA_DIR, 'works-full.json'); // 作品全量记录（含长文本/全部截图），供 /api/works 分页与 /api/work 详情
 const POOL_FULL_FILE = path.join(DATA_DIR, 'pool-full.json'); // 投稿池全量记录（含宣言/介绍/截图/体验链接），供 /api/submission 详情
 
+// 云数据库（WorkBuddy Cloud，PostgREST 风格 REST）
+// 仅使用可公开的 publishable key（前端同款），写权限由服务端 RLS 策略约束；
+// 抓取数据以云库为持久层，data/*.json 降级为快速启动缓存与兜底。
+const CLOUD_REST_BASE = 'https://wb1024-monitor.app.workbuddy.host/.cloud/database/rest';
+const CLOUD_PUBLISHABLE_KEY =
+  'wbpk_wQcEPpXJK77EMVCgf9VW1y_TnY0J09CvgJ3GzUnELKTylk1nyNAKcG6';
+const DB_SYNC_BATCH = 100;       // 每次 REST upsert 的行数
+const DB_SYNC_GAP_MS = 300;      // 批间节流
+const DB_SYNC_MAX_ERRORS = 5;    // 连续失败次数达到后本轮熔断（下轮轮询自动重试）
+
 // ---------------------------------------------------------------- 工具
 
 function log(...args) {
@@ -141,6 +151,141 @@ async function withRetry(fn, label) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------------------------------------------------------- 云库客户端（去重靠主键 upsert）
+
+function cloudRest(method, tablePath, { query, body, prefer } = {}) {
+  return new Promise((resolve, reject) => {
+    const qs = query ? '?' + query : '';
+    const payload = body === undefined ? null : JSON.stringify(body);
+    const headers = {
+      'x-wb-webapp-access-key': CLOUD_PUBLISHABLE_KEY,
+      'Content-Type': 'application/json'
+    };
+    if (prefer) headers.Prefer = prefer;
+    if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
+    const req = https.request(
+      CLOUD_REST_BASE + tablePath + qs,
+      { method, headers, timeout: HTTP_TIMEOUT_MS },
+      (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (raw += c));
+        res.on('end', () => {
+          if (res.statusCode >= 400) {
+            reject(new Error(`云库 ${method} ${tablePath} HTTP ${res.statusCode}: ${raw.slice(0, 160)}`));
+            return;
+          }
+          let data = null;
+          if (raw) {
+            try { data = JSON.parse(raw); } catch (e) { /* 空响应/纯文本 */ }
+          }
+          resolve(data);
+        });
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error('云库请求超时')));
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+/** 批量 upsert：on_conflict=id 合并去重；行内自动带 updated_at */
+const dbSkipped = new Set(); // 被网关 WAF 拒绝的行 id（如个别含敏感词的描述文本），跳过并记录
+
+async function dbUpsertRows(table, rows) {
+  const payload = rows.map((r) => Object.assign({}, r, { updated_at: new Date().toISOString() }));
+  try {
+    await cloudRest('POST', '/' + table, {
+      query: 'on_conflict=id',
+      body: payload,
+      prefer: 'resolution=merge-duplicates,return=minimal'
+    });
+    return rows.length;
+  } catch (e) {
+    // 网关 WAF 对个别行内容返回 403：二分隔离到单行，被拒行跳过、其余照常入库
+    if (rows.length > 1 && /HTTP 403/.test(e.message)) {
+      const mid = rows.length >> 1;
+      let n = 0;
+      n += await dbUpsertRows(table, rows.slice(0, mid));
+      n += await dbUpsertRows(table, rows.slice(mid));
+      return n;
+    }
+    if (rows.length === 1 && /HTTP 403/.test(e.message)) {
+      dbSkipped.add(rows[0].id);
+      log(`云库跳过被网关拦截的记录 ${table}/${rows[0].id}（WAF 403），该行仅存于 JSON 缓存`);
+      return 0;
+    }
+    throw e;
+  }
+}
+
+async function dbUpsertBatch(table, rows) {
+  let total = 0;
+  for (let i = 0; i < rows.length; i += DB_SYNC_BATCH) {
+    const chunk = rows
+      .slice(i, i + DB_SYNC_BATCH)
+      .filter((r) => !dbSkipped.has(r.id));
+    if (!chunk.length) continue;
+    total += await dbUpsertRows(table, chunk);
+    if (i + DB_SYNC_BATCH < rows.length) await sleep(DB_SYNC_GAP_MS);
+  }
+  return total;
+}
+
+/** 分页拉全某张云表（PostgREST limit/offset 循环，每页 1000 行） */
+async function dbSelectAll(table, cols) {
+  const out = [];
+  const select = cols.join(',');
+  for (let page = 0; page < 50; page++) {
+    const rows = await cloudRest('GET', '/' + table, {
+      query: `select=${select}&limit=1000&offset=${page * 1000}`
+    });
+    if (!Array.isArray(rows) || !rows.length) break;
+    out.push(...rows);
+    if (rows.length < 1000) break;
+  }
+  return out;
+}
+
+// 云库行映射（内存字段 -> 表列名；desc 在表内叫 description）
+function dbRowWork(w) {
+  return {
+    id: w.id, card_no: w.cardNo || 0, name: w.name || '', author: w.author || '',
+    form: w.form || '', tags: w.tags || '', highlight: w.highlight || '',
+    description: w.desc || '', manifesto: w.manifesto || '',
+    link: w.link || null, social: w.social || null,
+    platform: w.platform || '', shots: w.shots || []
+  };
+}
+function dbRowSubmission(r) {
+  return {
+    id: r.id, sid: r.sid || '', name: r.name || '', author: r.author || '',
+    form: r.form || '', status: r.status || '未知', submitted_at: r.submittedAt || '',
+    highlight: r.highlight || '', manifesto: r.manifesto || '', description: r.desc || '',
+    link: r.link || null, shots: r.shots || [], tags: r.tags || '',
+    card_no: r.cardNo == null ? null : r.cardNo, platform: r.platform || ''
+  };
+}
+function dbRowToWork(row) {
+  return {
+    id: row.id, cardNo: row.card_no || 0, name: row.name || '', author: row.author || '',
+    form: row.form || '', tags: row.tags || '', highlight: row.highlight || '',
+    desc: row.description || '', manifesto: row.manifesto || '',
+    link: row.link || null, social: row.social || null,
+    platform: row.platform || '', shots: row.shots || []
+  };
+}
+function dbRowToSubmission(row) {
+  return {
+    id: row.id, sid: row.sid || '', name: row.name || '', author: row.author || '',
+    form: row.form || '', status: row.status || '未知', submittedAt: row.submitted_at || '',
+    highlight: row.highlight || '', manifesto: row.manifesto || '', desc: row.description || '',
+    link: row.link || null, shots: row.shots || [], tags: row.tags || '',
+    cardNo: row.card_no == null ? null : row.card_no, platform: row.platform || ''
+  };
+}
 
 /** 分页拉全某张表；maxPages 可限制只拉前几页 */
 async function queryAll(dbId, extra, maxPages) {
@@ -289,6 +434,99 @@ function capturePoolFull(rows) {
   });
 }
 
+/** 上游按主键去重（同一记录理论上不会重复返回，防御性处理） */
+function dedupeById(rows) {
+  const seen = new Set();
+  return (rows || []).filter((r) => {
+    if (!r || !r._id || seen.has(r._id)) return false;
+    seen.add(r._id);
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------- 云库同步（脏行 diff + 串行队列）
+
+const dbSync = {
+  works: {},        // id -> 内容指纹（已同步）
+  submissions: {},  // id -> 内容指纹（已同步）
+  queue: Promise.resolve(),
+  upserted: 0,
+  lastSyncAt: null,
+  lastError: null,
+  consecutiveErrors: 0
+};
+
+/**
+ * diff 同步：与上次成功同步的内容指纹比对，只推送变化的行；
+ * 成功后记录指纹，失败则清指纹等待下轮重试。全程串行，避免批间交叉。
+ */
+function scheduleDbSync(table, memRows, toDbRow) {
+  const synced = dbSync[table];
+  const dirty = [];
+  const marks = [];
+  for (const r of memRows) {
+    if (!r || !r.id) continue;
+    if (dbSkipped.has(r.id)) continue; // 已被 WAF 拒绝过的行不再重试
+    const row = toDbRow(r);
+    const h = JSON.stringify(row);
+    if (synced[r.id] === h) continue;
+    dirty.push(row);
+    marks.push([r.id, h]);
+  }
+  if (!dirty.length) return;
+  dbSync.queue = dbSync.queue
+    .then(async () => {
+      if (dbSync.consecutiveErrors >= DB_SYNC_MAX_ERRORS) {
+        log(`云库同步熔断中（连续失败 ${dbSync.consecutiveErrors} 次），本轮跳过 ${dirty.length} 行`);
+        return;
+      }
+      await dbUpsertBatch(table, dirty);
+      marks.forEach(([id, h]) => { synced[id] = h; });
+      dbSync.upserted += dirty.length;
+      dbSync.lastSyncAt = new Date().toISOString();
+      dbSync.lastError = null;
+      dbSync.consecutiveErrors = 0;
+      log(`云库同步 ${table}: 推送 ${dirty.length} 行（累计 ${dbSync.upserted}）`);
+    })
+    .catch((e) => {
+      marks.forEach(([id]) => { delete synced[id]; });
+      dbSync.lastError = e.message;
+      dbSync.consecutiveErrors += 1;
+      log(`云库同步失败 ${table}（连续 ${dbSync.consecutiveErrors} 次）:`, e.message);
+    });
+}
+
+/** 启动 hydration：云库数据灌入内存缓存（DB 为持久层，优先于 JSON 缓存） */
+async function hydrateFromDb() {
+  try {
+    const works = await dbSelectAll('works',
+      ['id', 'card_no', 'name', 'author', 'form', 'tags', 'highlight', 'description', 'manifesto', 'link', 'social', 'platform', 'shots']);
+    if (works.length) {
+      const byId = {};
+      works.forEach((row) => {
+        const w = dbRowToWork(row);
+        byId[w.id] = w;
+        dbSync.works[w.id] = JSON.stringify(dbRowWork(w));
+      });
+      // DB 优先覆盖缓存；JSON 里有而 DB 没有的保留（尚未同步到云库的遗留数据）
+      state.worksFull = state.worksFull.filter((w) => !byId[w.id]).concat(works.map(dbRowToWork));
+      log('云库 hydration 作品:', works.length, '条，内存合计:', state.worksFull.length);
+    }
+    const subs = await dbSelectAll('submissions',
+      ['id', 'sid', 'name', 'author', 'form', 'status', 'submitted_at', 'highlight', 'manifesto', 'description', 'link', 'shots', 'tags', 'card_no', 'platform']);
+    if (subs.length) {
+      subs.forEach((row) => {
+        const r = dbRowToSubmission(row);
+        state.poolFull[r.id] = r;
+        dbSync.submissions[r.id] = JSON.stringify(dbRowSubmission(r));
+      });
+      log('云库 hydration 投稿:', subs.length, '条，内存合计:', Object.keys(state.poolFull).length);
+    }
+  } catch (e) {
+    log('云库 hydration 失败（继续用 JSON 缓存启动）:', e.message);
+  }
+}
+
 // ---------------------------------------------------------------- 快照状态
 
 const state = {
@@ -360,17 +598,21 @@ function loadPersisted() {
 
 async function fastPoll() {
   const [wallCount, poolCount] = await Promise.all([aggregateCount(DB_WALL), aggregateCount(DB_POOL)]);
-  const [wallRows, recentRows] = await Promise.all([
+  let [wallRows, recentRows] = await Promise.all([
     queryAll(DB_WALL, { sorts: [{ property: '卡片号', direction: 'descending' }] }),
     queryAll(DB_POOL, { pageSize: 40, sorts: [{ property: '提交时间', direction: 'descending' }] }, 1)
   ]);
 
+  wallRows = dedupeById(wallRows);
+  recentRows = dedupeById(recentRows);
   const works = wallRows.map(mapWork).filter((w) => w.name);
   const recent = recentRows.map(slimPool);
   capturePoolFull(recentRows); // 最新 40 条的全量记录进缓存
+  scheduleDbSync('submissions', recentRows.map(richPool), dbRowSubmission);
 
   state.worksFull = works; // 全量进内存缓存（分页接口的数据源）
   atomicWriteJson(WORKS_FULL_FILE, works);
+  scheduleDbSync('works', works, dbRowWork);
 
   const prev = state.snapshot || {};
   const prevStats = prev.stats || {};
@@ -432,9 +674,10 @@ async function fastPoll() {
 }
 
 async function deepPoll() {
-  const poolRows = await queryAll(DB_POOL);
+  const poolRows = dedupeById(await queryAll(DB_POOL));
   const pool = poolRows.map(slimPool);
   capturePoolFull(poolRows); // 全池全量记录进缓存
+  scheduleDbSync('submissions', poolRows.map(richPool), dbRowSubmission);
   atomicWriteJson(POOL_FULL_FILE, Object.values(state.poolFull)); // 持久化，重启不丢
 
   const byStatus = {};
@@ -579,6 +822,14 @@ const server = http.createServer((req, res) => {
       ok: true,
       uptime: process.uptime(),
       hasSnapshot: !!state.snapshot,
+      dbSync: {
+        upserted: dbSync.upserted,
+        lastSyncAt: dbSync.lastSyncAt,
+        lastError: dbSync.lastError,
+        consecutiveErrors: dbSync.consecutiveErrors,
+        worksSynced: Object.keys(dbSync.works).length,
+        submissionsSynced: Object.keys(dbSync.submissions).length
+      },
       poller: state.poller
     });
     return;
@@ -660,6 +911,43 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  /* ---------- 投稿池分页查询（动态页/全池列表，服务端筛选 + 排序 + 分页） ---------- */
+  if (pathname === '/api/submissions') {
+    const q = u.searchParams;
+    const per = Math.min(Math.max(parseInt(q.get('per'), 10) || 50, 1), 100);
+    const page = Math.max(1, parseInt(q.get('page'), 10) || 1);
+    const sort = q.get('sort') || 'newest';
+    const status = q.get('status') || '';
+    const kw = (q.get('kw') || '').trim().toLowerCase();
+
+    let matched = Object.values(state.poolFull);
+    if (status) matched = matched.filter((r) => r.status === status);
+    if (kw) {
+      matched = matched.filter((r) =>
+        (r.name + ' ' + r.author + ' ' + r.highlight + ' ' + r.sid).toLowerCase().indexOf(kw) >= 0
+      );
+    }
+    const sorted = matched.slice().sort((a, b) => {
+      if (sort === 'oldest') return String(a.submittedAt).localeCompare(String(b.submittedAt));
+      if (sort === 'name') return String(a.name).localeCompare(String(b.name), 'zh');
+      return String(b.submittedAt).localeCompare(String(a.submittedAt)); // newest（默认）
+    });
+    const total = sorted.length;
+    const start = (page - 1) * per;
+    sendJson(res, {
+      total,
+      page,
+      per,
+      pages: Math.max(1, Math.ceil(total / per)),
+      submissions: sorted.slice(start, start + per).map((r) => ({
+        id: r.id, sid: r.sid, name: r.name, author: r.author, form: r.form,
+        status: r.status, submittedAt: r.submittedAt, highlight: r.highlight,
+        cardNo: r.cardNo, platform: r.platform
+      }))
+    });
+    return;
+  }
+
   // 投稿池单条全量详情（含宣言/介绍/截图/体验链接）—— 动态页详情弹窗用
   if (pathname === '/api/submission') {
     const pid = u.searchParams.get('id') || '';
@@ -719,8 +1007,11 @@ loadPersisted();
 server.listen(PORT, HOST, () => {
   log(`监控台服务已启动: http://${HOST}:${PORT}`);
   log(`快速轮询间隔 ${FAST_POLL_MS}ms，深度轮询间隔 ${DEEP_POLL_MS}ms`);
-  // 启动即同步：先快速轮询（秒级出作品数据），再深度扫描
-  safePoll('fast').then(() => safePoll('deep'));
+  // 启动即同步：先从云库 hydration（JSON 只是兜底缓存），再快速轮询（秒级出作品数据），最后深度扫描
+  hydrateFromDb()
+    .catch(() => {})
+    .then(() => safePoll('fast'))
+    .then(() => safePoll('deep'));
 
   setInterval(() => safePoll('fast'), FAST_POLL_MS);
   setInterval(() => safePoll('deep'), DEEP_POLL_MS);
