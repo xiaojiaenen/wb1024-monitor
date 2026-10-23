@@ -9,8 +9,16 @@
   // ------------------------------------------------------------ 状态
   var snapshot = null;
   var filters = { keyword: '', form: '', platform: '', sort: 'cardDesc' };
-  var visibleCount = 60;
+  var worksPage = 1;          /* 作品库当前页码 */
+  var worksPerPage = 24;      /* 作品库每页行数 */
+  var worksTotal = 0;         /* 服务端返回的筛选后总数 */
+  var worksReqToken = 0;      /* 请求序号：丢弃过期响应，防止快速翻页乱序 */
+  var worksLoading = false;
+  var aiScoresCache = { at: 0, map: null }; /* AI 评分映射（cardNo -> total），60s 缓存 */
+  var dbScores = {};                        /* 评分单元格的数据库兜底（AI 排序拉取时填充） */
   var warmEnd = 60;
+  var snapshotVersion = 0;    /* 快照数据版本：筛选结果缓存的失效依据 */
+  var voteVersion = 0;        /* 互动数据版本：投票/收藏变化后重排的依据 */
   var route = '';
   var openId = '';
   var aiReady = false;
@@ -227,6 +235,20 @@
   }
 
   // ------------------------------------------------------------ 数据拉取
+  /* 统一 GET 助手：params 中的空值自动剔除 */
+  function apiGet(url, params) {
+    var q = [];
+    Object.keys(params || {}).forEach(function (k) {
+      var v = params[k];
+      if (v !== '' && v != null) q.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+    });
+    var full = url + (q.length ? '?' + q.join('&') : '');
+    return fetch(full, { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
   function loadSnapshot() {
     fetch('/api/snapshot', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
@@ -238,6 +260,7 @@
         }
         var first = !snapshot;
         snapshot = data;
+        snapshotVersion++;
         renderSync();
         if (first) {
           renderPage();
@@ -268,11 +291,14 @@
       aiReady = true;
       getVoterId();
       loadInteractions(true);
-      warmMore(0);
-      updateAiBadge();
-      /* AI 就绪后立即刷新依赖 AI 的区域 */
-      if (route === '') { renderStats(); renderBoard(); renderAiPanel(); }
-      if (route === 'ratings') { renderRatingsMeta(); renderRatingsList(); }
+      /* 先 hydration 全量分析缓存，再预热缺失的最新作品 */
+      Analysis.hydrateFromDb().then(function () {
+        warmMore(0);
+        updateAiBadge();
+        /* AI 就绪后立即刷新依赖 AI 的区域 */
+        if (route === '') { renderStats(); renderBoard(); renderAiPanel(); }
+        if (route === 'ratings') { renderRatingsMeta(); renderRatingsList(); }
+      });
     }).catch(function (e) {
       aiFault = 'AI 模块加载失败：' + (e && e.message ? e.message : '网络错误');
       console.warn(aiFault);
@@ -282,7 +308,14 @@
   function warmMore(extra) {
     if (!snapshot || !snapshot.works) return;
     if (extra) warmEnd += extra;
-    Analysis.warmLatest(snapshot.works.slice(0, warmEnd));
+    Analysis.warmLatest(snapshot.works.slice(0, warmEnd), hydrateWorks);
+  }
+
+  /* 按 ID 批量补拉作品全量记录（AI 分析的 prompt 需要 desc/manifesto/social，快照里已瘦身） */
+  function hydrateWorks(ids) {
+    return apiGet('/api/works', { ids: ids.join(','), full: 1 }).then(function (res) {
+      return (res && res.works) || [];
+    });
   }
 
   var lastCachedCount = -1;
@@ -301,7 +334,7 @@
     }
     if (aiReady && route === 'works' && n !== lastCachedCount) {
       lastCachedCount = n;
-      renderWorksBody();
+      fetchWorksPage(true);   /* AI 评分列/排序可能变化，静默重拉当前页 */
     }
     if (aiReady && route === 'insights' && n !== lastCachedCount) {
       lastCachedCount = n;
@@ -327,6 +360,7 @@
         var p = k.split('|');
         if (p[1] === vid) interactions.mineFavs[p[0]] = true;
       });
+      voteVersion++;
       if (!initial) refreshDynamic();
     }).catch(function (e) {
       console.warn('互动数据加载失败', e);
@@ -351,6 +385,7 @@
     }
     syncPopCells(key);
     if (btn) btn.classList.toggle('on', !wasVoted);
+    voteVersion++;
     var act = wasVoted ? Cloud.dbUnvote(key, getVoterId()) : Cloud.dbVote(key, getVoterId());
     act.catch(function () {
       /* 回滚 */
@@ -362,6 +397,7 @@
         interactions.votes[key] = Math.max(0, (interactions.votes[key] || 0) - 1);
       }
       syncPopCells(key);
+      voteVersion++;
       if (btn) btn.classList.toggle('on', wasVoted);
       toast('操作失败，请稍后重试');
     });
@@ -379,6 +415,7 @@
     }
     syncPopCells(key);
     if (btn) btn.classList.toggle('on', !wasFaved);
+    voteVersion++;
     var act = wasFaved ? Cloud.dbUnfavorite(key, getVoterId()) : Cloud.dbFavorite(key, getVoterId());
     act.catch(function () {
       if (wasFaved) {
@@ -389,6 +426,7 @@
         interactions.favs[key] = Math.max(0, (interactions.favs[key] || 0) - 1);
       }
       syncPopCells(key);
+      voteVersion++;
       if (btn) btn.classList.toggle('on', wasFaved);
       toast('操作失败，请稍后重试');
     });
@@ -431,6 +469,13 @@
       h = h.slice(0, qIdx);
       var m = q.match(/(?:^|&)open=([^&]+)/);
       if (m) openId = decodeURIComponent(m[1]);
+      /* 作品库分页深链：page / per */
+      if (h === 'works') {
+        var mp = q.match(/(?:^|&)page=(\d+)/);
+        var mpr = q.match(/(?:^|&)per=(\d+)/);
+        if (mp) worksPage = Math.max(1, parseInt(mp[1], 10) || 1);
+        if (mpr) worksPerPage = [24, 48, 96].indexOf(parseInt(mpr[1], 10)) >= 0 ? parseInt(mpr[1], 10) : 24;
+      }
     }
     return PAGES[h] ? h : '';
   }
@@ -461,7 +506,7 @@
   function refreshDynamic() {
     renderSync();
     if (route === '') { renderStats(); renderCharts(); renderAiPanel(); renderBoard(); renderWall(); renderTicker(); }
-    else if (route === 'works') { renderWorksBody(); }
+    else if (route === 'works') { fetchWorksPage(true); }
     else if (route === 'ratings') { renderRatingsMeta(); renderRatingsList(); }
     else if (route === 'insights') { renderCharts(); renderBreakdown(); renderHistogram(); renderPopularity(); }
     else if (route === 'feed') { renderStream(); }
@@ -485,7 +530,6 @@
 
   // ============================================================ 页面：总览
   function renderOverview() {
-    if (tickerTimer) { clearInterval(tickerTimer); tickerTimer = null; }
     $('page').innerHTML =
       '<div class="kpis" id="kpis"></div>' +
       '<div class="row">' +
@@ -511,11 +555,10 @@
     renderWall();
     renderAiPanel();
     renderTicker();
-    tickerTimer = setInterval(renderTicker, 4000);
   }
 
-  var tickerTimer = null;
-
+  /* 签名跳过：数据没变就不重建 DOM（30s 轮询/2s 徽标刷新时不闪烁、不重排） */
+  var sigStats = '';
   function renderStats() {
     var s = (snapshot && snapshot.stats) || {};
     var el = $('kpis');
@@ -523,6 +566,9 @@
     var totalVotes = 0;
     Object.keys(interactions.votes).forEach(function (k) { totalVotes += interactions.votes[k]; });
     var st = Analysis.getStats();
+    var sig = [s.wallTotal, s.newToday, s.poolTotal, s.poolPending, st.cachedCount, totalVotes, s.deltaPool60s].join(',');
+    if (sig === sigStats) return;
+    sigStats = sig;
     var defs = [
       { k: '已上架作品', v: fmtNum(s.wallTotal), s: '网页 ' + fmtNum(s.webApps) + ' / 小程序 ' + fmtNum(s.miniApps) },
       { k: '今日投稿', v: '+' + fmtNum(s.newToday), s: '北京时间 · 当日投稿池新增', hot: true },
@@ -538,14 +584,24 @@
     }).join('');
   }
 
+  var sigBoard = '';
   function renderBoard() {
     var el = $('board');
     if (!el) return;
     var list = analyzedWorks().slice(0, 10);
     if (!list.length) {
-      el.innerHTML = '<tr><td style="padding:18px 12px;color:var(--muted);font-size:14px">AI 评审准备中，首批分析完成后这里会出现结果榜…</td></tr>';
+      if (sigBoard !== 'empty') {
+        el.innerHTML = '<tr><td style="padding:18px 12px;color:var(--muted);font-size:14px">AI 评审准备中，首批分析完成后这里会出现结果榜…</td></tr>';
+        sigBoard = 'empty';
+      }
       return;
     }
+    var sig = list.map(function (w) {
+      var p = Analysis.getCached(Analysis.workKey(w));
+      return w.id + ':' + p.total;
+    }).join(',');
+    if (sig === sigBoard) return;
+    sigBoard = sig;
     el.innerHTML = list.map(function (w, i) {
       var p = Analysis.getCached(Analysis.workKey(w));
       return '<tr data-open="' + esc(w.id) + '">' +
@@ -558,10 +614,17 @@
     }).join('');
   }
 
+  var sigWall = '';
   function renderWall() {
     var el = $('wall');
     if (!el) return;
     var list = (snapshot.works || []).slice().sort(function (a, b) { return b.cardNo - a.cardNo; }).slice(0, 6);
+    var sig = list.map(function (w) {
+      var p = Analysis.getCached(Analysis.workKey(w));
+      return w.id + ':' + (p ? p.total : '-');
+    }).join(',');
+    if (sig === sigWall) return;
+    sigWall = sig;
     el.innerHTML = list.map(function (w, i) {
       var p = Analysis.getCached(Analysis.workKey(w));
       var shot = w.shots && w.shots[0] && w.shots[0].url;
@@ -577,25 +640,33 @@
     }).join('');
   }
 
-  var tickIdx = 0;
+  /* 流水 ticker：CSS 无缝滚动（一份内容重复两遍），数据变化才重建 */
+  var sigTicker = '';
   function renderTicker() {
     var el = $('ticker');
     if (!el) return;
     var recent = snapshot.recentSubmissions || [];
-    if (!recent.length) { el.innerHTML = '<div style="padding:0 16px;font-size:14px;color:var(--muted)">投稿流水采集中…</div>'; return; }
-    var items = [];
-    for (var i = 0; i < 3; i++) {
-      var r = recent[(tickIdx + i) % recent.length];
+    if (!recent.length) {
+      if (sigTicker !== 'empty') {
+        el.innerHTML = '<div style="padding:0 16px;font-size:14px;color:var(--muted)">投稿流水采集中…</div>';
+        sigTicker = 'empty';
+      }
+      return;
+    }
+    var sig = recent.map(function (r) { return (r.id || r.name) + ':' + r.status; }).join(',');
+    if (sig === sigTicker) return;
+    sigTicker = sig;
+    var item = function (r) {
       var cls = r.status === '待审核' ? 'p' : (r.status === '已通过' ? 'a' : 'r');
-      items.push('<div class="tick-item"><span class="nm">' + esc(r.name) + '</span>' +
+      return '<div class="tick-item"><span class="nm">' + esc(r.name) + '</span>' +
         '<span class="au">@' + esc(r.author) + '</span>' +
         '<span class="st ' + cls + '">' + esc(r.status) + '</span>' +
-        '<span class="t">' + esc((r.submittedAt || '').slice(11)) + '</span></div>');
-    }
-    el.innerHTML = items.join('');
-    tickIdx = (tickIdx + 1) % recent.length;
+        '<span class="t">' + esc((r.submittedAt || '').slice(11)) + '</span></div>';
+    };
+    el.innerHTML = '<div class="tick-rail">' + recent.map(item).join('') + recent.map(item).join('') + '</div>';
   }
 
+  var sigAiPanel = '';
   function renderAiPanel() {
     var el = $('aiPanel');
     if (!el) return;
@@ -603,6 +674,9 @@
     var works = snapshot.works || [];
     var st = Analysis.getStats();
     if (metaEl) metaEl.textContent = (window.__aiModel ? '模型 ' + window.__aiModel : '模型加载中') + ' · 每件约 30-40 秒';
+    var sig = [aiReady ? 1 : 0, aiFault || '', window.__aiModel || '', st.cachedCount, st.queued, works.length].join(',');
+    if (sig === sigAiPanel) return;
+    sigAiPanel = sig;
     if (!aiReady) {
       el.innerHTML = '<div class="ai-note">' + (aiFault ? esc(aiFault) + '，AI 功能暂不可用，数据看板不受影响。' : 'AI 模块加载中…') + '</div>';
       return;
@@ -635,6 +709,8 @@
 
   // ============================================================ 页面：作品库
   function renderWorksPage() {
+    worksRowMap = {};   /* 新 tbody，旧行引用全部作废 */
+    sigPager = '';
     $('page').innerHTML =
       '<div class="panel" style="height:calc(100vh - 150px);min-height:420px">' +
       '<div class="panel-h"><h2>作品库</h2><div class="rule"></div><span class="meta" id="worksCountNote">–</span></div>' +
@@ -650,15 +726,17 @@
       '<option value="name"' + (filters.sort === 'name' ? ' selected' : '') + '>名称 A→Z</option>' +
       '</select>' +
       '</div>' +
-      '<div class="table-wrap"><table class="works"><thead><tr>' +
-      '<th class="c-no">#</th><th>作品</th><th>作者</th><th class="c-form">形态</th><th class="c-plat">平台</th><th class="c-ai">AI 评分</th><th class="c-pop">人气</th><th class="c-link"></th>' +
+      '<div class="table-wrap"><table class="works"><colgroup>' +
+      '<col style="width:46px"><col style="width:84px"><col><col style="width:120px"><col style="width:86px"><col style="width:110px"><col style="width:76px"><col style="width:96px"><col style="width:72px">' +
+      '</colgroup><thead><tr>' +
+      '<th class="c-no">#</th><th class="c-shot">截图</th><th>作品</th><th>作者</th><th class="c-form">形态</th><th class="c-plat">平台</th><th class="c-ai">AI 评分</th><th class="c-pop">人气</th><th class="c-link"></th>' +
       '</tr></thead><tbody id="worksBody"></tbody></table>' +
       '<div class="empty" id="worksEmpty" hidden>没有符合条件的作品</div></div>' +
-      '<div class="table-foot"><span id="worksShown">–</span><button class="btn" id="loadMoreBtn" hidden>加载更多</button></div>' +
+      '<div class="table-foot"><span id="worksShown">–</span><div class="pager" id="worksPager"></div></div>' +
       '</div>';
     buildPlatformOptions();
     bindWorksFilters();
-    renderWorksBody();
+    fetchWorksPage();
   }
 
   function buildPlatformOptions() {
@@ -680,49 +758,174 @@
       clearTimeout(timer);
       timer = setTimeout(function () {
         filters.keyword = kw.value;
-        visibleCount = 60;
-        renderWorksBody();
+        worksPage = 1;
+        fetchWorksPage();
+        syncWorksUrl();
       }, 200);
     });
-    $('fForm').addEventListener('change', function () { filters.form = this.value; visibleCount = 60; renderWorksBody(); });
-    $('fPlatform').addEventListener('change', function () { filters.platform = this.value; visibleCount = 60; renderWorksBody(); });
-    $('fSort').addEventListener('change', function () { filters.sort = this.value; renderWorksBody(); });
-    $('loadMoreBtn').addEventListener('click', function () { visibleCount += 120; renderWorksBody(); });
+    $('fForm').addEventListener('change', function () { filters.form = this.value; worksPage = 1; fetchWorksPage(); syncWorksUrl(); });
+    $('fPlatform').addEventListener('change', function () { filters.platform = this.value; worksPage = 1; fetchWorksPage(); syncWorksUrl(); });
+    $('fSort').addEventListener('change', function () { filters.sort = this.value; worksPage = 1; fetchWorksPage(); syncWorksUrl(); });
+    bindPager();
   }
 
-  function filteredWorks() {
-    var list = (snapshot.works || []).slice();
-    var kw = filters.keyword.trim().toLowerCase();
-    if (kw) {
-      list = list.filter(function (w) {
-        return (w.name + ' ' + w.author + ' ' + w.highlight + ' ' + w.tags + ' ' + w.manifesto).toLowerCase().indexOf(kw) >= 0;
+  /* 分页参数同步进 hash（replaceState 不触发 hashchange，不打断当前页面） */
+  function syncWorksUrl() {
+    var pages = Math.max(1, Math.ceil(worksTotal / worksPerPage));
+    var q = 'page=' + Math.min(worksPage, pages) + '&per=' + worksPerPage;
+    history.replaceState(null, '', '#/works?' + q);
+  }
+
+  /* 翻页：越界钳制；页码变化只重拉当前页 */
+  function gotoWorksPage(p) {
+    var pages = Math.max(1, Math.ceil(worksTotal / worksPerPage));
+    var next = Math.min(pages, Math.max(1, p));
+    if (next === worksPage) return;
+    worksPage = next;
+    fetchWorksPage();
+    syncWorksUrl();
+  }
+
+  /* 作品库列表：服务端分页 + DOM diff（只拉当前页；复用行节点，刷新/分析完成不整表重建） */
+  var worksRowMap = {};   /* workId -> tr 元素 */
+
+  /* 拉取当前页并渲染（token 防止快速翻页时旧响应覆盖新页；silent=静默刷新不显示加载态） */
+  function fetchWorksPage(silent) {
+    var token = ++worksReqToken;
+    var foot = $('worksShown');
+    if (foot && !silent) foot.textContent = '加载中…';
+    var base = {
+      page: worksPage, per: worksPerPage,
+      kw: filters.keyword.trim(), form: filters.form, platform: filters.platform,
+      sort: filters.sort
+    };
+    var chain;
+    if (filters.sort === 'aiDesc' || filters.sort === 'popDesc') {
+      /* AI 评分/人气排序：先拿全量 ID 列表（轻量），客户端算序后按 ID 取当前页 */
+      chain = apiGet('/api/works', Object.assign({}, base, { only: 'ids' }))
+        .then(function (idRes) {
+          return orderWorksClient((idRes && idRes.ids) || [], filters.sort).then(function (ordered) {
+            worksTotal = ordered.length;
+            var start = (worksPage - 1) * worksPerPage;
+            var pageIds = ordered.slice(start, start + worksPerPage);
+            return pageIds.length ? apiGet('/api/works', { ids: pageIds.join(',') }) : { works: [] };
+          });
+        })
+        .then(function (res) { return (res && res.works) || []; });
+    } else {
+      chain = apiGet('/api/works', base).then(function (res) {
+        worksTotal = (res && res.total) || 0;
+        return (res && res.works) || [];
       });
     }
-    if (filters.form) list = list.filter(function (w) { return w.form === filters.form; });
-    if (filters.platform) list = list.filter(function (w) { return w.platform === filters.platform; });
-    if (filters.sort === 'cardDesc') list.sort(function (a, b) { return b.cardNo - a.cardNo; });
-    else if (filters.sort === 'cardAsc') list.sort(function (a, b) { return a.cardNo - b.cardNo; });
-    else if (filters.sort === 'name') list.sort(function (a, b) { return a.name.localeCompare(b.name, 'zh'); });
-    else if (filters.sort === 'aiDesc') {
-      list.sort(function (a, b) {
-        var pa = Analysis.getCached(Analysis.workKey(a)), pb = Analysis.getCached(Analysis.workKey(b));
-        return (pb ? pb.total : -1) - (pa ? pa.total : -1);
+    return chain.then(function (works) {
+      if (token !== worksReqToken) return;   /* 过期响应丢弃 */
+      renderWorksRows(works);
+      renderPager(worksTotal);
+      updateWorksFoot();
+      syncWorksUrl();
+    }).catch(function (e) {
+      if (token !== worksReqToken) return;
+      if (foot) foot.textContent = '加载失败：' + (e && e.message ? e.message : '网络错误');
+      console.warn('作品页加载失败', e);
+    });
+  }
+
+  /* 客户端排序：AI 评分（一次库查询，60s 缓存）/ 社区人气（本地投票数据） */
+  function orderWorksClient(pairs, sort) {
+    var keyFn;
+    var ready = sort === 'popDesc'
+      ? Promise.resolve()
+      : getAiScores().then(function (map) {
+        keyFn = function (x) { return map[String(x.cardNo)] != null ? map[String(x.cardNo)] : -1; };
       });
-    } else if (filters.sort === 'popDesc') {
-      list.sort(function (a, b) { return voteCount(Analysis.workKey(b)) - voteCount(Analysis.workKey(a)); });
+    if (sort === 'popDesc') keyFn = function (x) { return voteCount(String(x.cardNo)); };
+    return ready.then(function () {
+      return pairs.slice().sort(function (a, b) {
+        var d = keyFn(b) - keyFn(a);
+        return d !== 0 ? d : b.cardNo - a.cardNo;   /* 同分按卡片号新的在前 */
+      }).map(function (x) { return x.id; });
+    });
+  }
+
+  /* 全量 AI 评分映射（cardNo -> total），作品库 AI 排序用 */
+  function getAiScores() {
+    if (aiScoresCache.map && Date.now() - aiScoresCache.at < 60000) {
+      return Promise.resolve(aiScoresCache.map);
     }
-    return list;
+    return Cloud.dbSelectAllAnalysisScores().then(function (map) {
+      aiScoresCache = { at: Date.now(), map: map };
+      dbScores = map;   /* 同步供评分单元格兜底显示 */
+      return map;
+    }).catch(function (e) {
+      console.warn('AI 评分映射拉取失败，退回卡片号排序', e);
+      aiScoresCache = { at: Date.now() - 50000, map: null }; /* 10s 后重试，不长期缓存失败 */
+      return {};
+    });
+  }
+
+  function renderWorksRows(works) {
+    var tbody = $('worksBody');
+    if (!tbody) return;
+    var nextMap = {};
+    var frag = document.createDocumentFragment();
+    works.forEach(function (w) {
+      var tr = worksRowMap[w.id];
+      if (tr && tr.parentNode === tbody) updateWorkRow(tr, w);
+      else tr = htmlToElement(workRow(w));
+      nextMap[w.id] = tr;
+      frag.appendChild(tr);
+    });
+    Object.keys(worksRowMap).forEach(function (k) {
+      if (!nextMap[k] && worksRowMap[k].parentNode) worksRowMap[k].parentNode.removeChild(worksRowMap[k]);
+    });
+    tbody.appendChild(frag);   /* 复用行随 frag 落到本页顺序，一次重排 */
+    worksRowMap = nextMap;
+    var empty = $('worksEmpty');
+    if (empty) empty.hidden = worksTotal > 0;
+  }
+
+  function updateWorksFoot() {
+    var el = $('worksShown');
+    if (!el) return;
+    if (!worksTotal) { el.textContent = '没有符合条件的作品'; return; }
+    var start = (worksPage - 1) * worksPerPage;
+    el.textContent = '显示 ' + fmtNum(start + 1) + '–' + fmtNum(Math.min(start + worksPerPage, worksTotal)) +
+      ' / 共 ' + fmtNum(worksTotal) + ' 件';
+    var note = $('worksCountNote');
+    if (note) note.textContent = '作品墙共 ' + fmtNum((snapshot.works || []).length) + ' 件 · 当前筛选 ' + fmtNum(worksTotal) + ' 件';
   }
 
   function aiCell(w) {
-    var p = Analysis.getCached(Analysis.workKey(w));
+    var key = Analysis.workKey(w);
+    var p = Analysis.getCached(key);
     if (p) return '<span class="ai-score">' + p.total + '<small> /100</small></span>';
+    /* 内存没有但数据库有（往期会话分析的）：用排序时拉取的评分兜底显示 */
+    if (dbScores[key] != null) return '<span class="ai-score">' + dbScores[key] + '<small> /100</small></span>';
     return '<span class="ai-score pending">待分析</span>';
+  }
+
+  function htmlToElement(html) {
+    var t = document.createElement('template');
+    t.innerHTML = html;
+    return t.content.firstElementChild;
+  }
+
+  /* 行内动态单元格更新（AI 评分 / 人气），供 DOM diff 复用行时调用 */
+  function updateWorkRow(tr, w) {
+    var key = Analysis.workKey(w);
+    var aiTd = tr.querySelector('.c-ai');
+    if (aiTd) aiTd.innerHTML = aiCell(w);
+    var popTd = tr.querySelector('.c-pop');
+    if (popTd) {
+      popTd.setAttribute('data-pop', key);
+      popTd.innerHTML = popCellHtml(key);
+    }
   }
 
   function workRow(w) {
     var key = Analysis.workKey(w);
-    var shot = w.shots && w.shots[0] && w.shots[0].url;
+    var shot = w.shot || (w.shots && w.shots[0] && w.shots[0].url);
     var formChip = w.form === '小程序应用' ? '<span class="chip mini">小程序</span>' : '<span class="chip web">网页</span>';
     var link = w.link && w.link.link
       ? '<a class="link-btn" href="' + esc(w.link.link) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">体验</a>'
@@ -730,11 +933,11 @@
     return '<tr data-open="' + esc(w.id) + '">' +
       '<td class="c-no no">' + (w.cardNo || '–') + '</td>' +
       '<td>' + (shot
-        ? '<img class="shot" loading="lazy" src="' + esc(shot) + '" alt="">'
+        ? '<img class="shot" loading="lazy" decoding="async" src="' + esc(shot) + '" alt="">'
         : '<div class="shot-ph">无图</div>') + '</td>' +
       '<td><div class="w-name">' + esc(w.name) + '</div>' +
       '<div class="w-hl">' + esc(w.highlight) + '</div></td>' +
-      '<td>' + esc(w.author) + '</td>' +
+      '<td class="c-au"><span class="w-au">' + esc(w.author) + '</span></td>' +
       '<td class="c-form">' + formChip + '</td>' +
       '<td class="c-plat">' + (w.platform ? '<span class="chip">' + esc(w.platform) + '</span>' : '<span style="color:var(--muted)">–</span>') + '</td>' +
       '<td class="c-ai">' + aiCell(w) + '</td>' +
@@ -743,14 +946,53 @@
       '</tr>';
   }
 
-  function renderWorksBody() {
-    var list = filteredWorks();
-    var shown = list.slice(0, visibleCount);
-    $('worksBody').innerHTML = shown.map(workRow).join('');
-    $('worksEmpty').hidden = list.length > 0;
-    $('worksCountNote').textContent = '共 ' + fmtNum((snapshot.works || []).length) + ' 件 · 当前筛选 ' + fmtNum(list.length) + ' 件';
-    $('worksShown').textContent = '显示 ' + shown.length + ' / ' + list.length + ' 件';
-    $('loadMoreBtn').hidden = list.length <= visibleCount;
+  /* 页码器：首页/上一页/当前±1/末页 + 每页条数 */
+  var sigPager = '';
+  function renderPager(total) {
+    var el = $('worksPager');
+    if (!el) return;
+    var pages = Math.max(1, Math.ceil(total / worksPerPage));
+    var p = Math.min(worksPage, pages);
+    var sig = [total, pages, p, worksPerPage].join(',');
+    if (sig === sigPager) return;
+    sigPager = sig;
+    var html = '<button class="pg-btn" data-pg="1"' + (p <= 1 ? ' disabled' : '') + '>首页</button>' +
+      '<button class="pg-btn" data-pg="' + (p - 1) + '"' + (p <= 1 ? ' disabled' : '') + '>上一页</button>';
+    var nums = [];
+    for (var i = 1; i <= pages; i++) {
+      if (i === 1 || i === pages || Math.abs(i - p) <= 1) nums.push(i);
+    }
+    var last = 0;
+    nums.forEach(function (n) {
+      if (n - last > 1) html += '<span class="pg-ell">…</span>';
+      html += '<button class="pg-btn' + (n === p ? ' on' : '') + '" data-pg="' + n + '">' + n + '</button>';
+      last = n;
+    });
+    html += '<button class="pg-btn" data-pg="' + (p + 1) + '"' + (p >= pages ? ' disabled' : '') + '>下一页</button>' +
+      '<button class="pg-btn" data-pg="' + pages + '"' + (p >= pages ? ' disabled' : '') + '>末页 ' + pages + '</button>' +
+      '<span class="pg-per">每页<select id="worksPerPage" aria-label="每页条数">' +
+      [24, 48, 96].map(function (n) { return '<option value="' + n + '"' + (worksPerPage === n ? ' selected' : '') + '>' + n + '</option>'; }).join('') +
+      '</select>条</span>';
+    el.innerHTML = html;
+  }
+
+  /* 分页器事件委托（容器不变，只绑一次） */
+  function bindPager() {
+    var el = $('worksPager');
+    if (!el || el.dataset.bound) return;
+    el.dataset.bound = '1';
+    el.addEventListener('click', function (e) {
+      var b = e.target.closest('.pg-btn[data-pg]');
+      if (b && !b.disabled) gotoWorksPage(parseInt(b.getAttribute('data-pg'), 10));
+    });
+    el.addEventListener('change', function (e) {
+      if (e.target && e.target.id === 'worksPerPage') {
+        worksPerPage = parseInt(e.target.value, 10) || 24;
+        worksPage = 1;
+        fetchWorksPage();
+        syncWorksUrl();
+      }
+    });
   }
 
   // ============================================================ 页面：AI 评审
@@ -803,18 +1045,29 @@
     return works;
   }
 
+  var sigRatings = '';
   function renderRatingsList() {
     var el = $('boardFull');
     if (!el) return;
     var list = analyzedWorks().slice(0, 120);
     if (!list.length) {
-      el.innerHTML = '<tr><td style="padding:18px 12px;color:var(--muted);font-size:14px">' +
-        (aiReady ? '还没有已完成分析的作品。打开任意作品详情即可触发分析。' : 'AI 模块加载中…') + '</td></tr>';
-      $('ratingsDetail').innerHTML = '<div class="empty">选择左侧榜单中的作品查看完整评审依据</div>';
+      if (sigRatings !== 'empty') {
+        el.innerHTML = '<tr><td style="padding:18px 12px;color:var(--muted);font-size:14px">' +
+          (aiReady ? '还没有已完成分析的作品。打开任意作品详情即可触发分析。' : 'AI 模块加载中…') + '</td></tr>';
+        $('ratingsDetail').innerHTML = '<div class="empty">选择左侧榜单中的作品查看完整评审依据</div>';
+        sigRatings = 'empty';
+      }
       return;
     }
     var selKey = ratingsSel && list.some(function (w) { return Analysis.workKey(w) === ratingsSel; }) ? ratingsSel : Analysis.workKey(list[0]);
     ratingsSel = selKey;
+    /* 签名：榜单 id+分数+选中行；3s 定时器命中即跳过，用户点选/新分析完成才重建 */
+    var sig = selKey + '|' + list.map(function (w) {
+      var p = Analysis.getCached(Analysis.workKey(w));
+      return w.id + ':' + p.total;
+    }).join(',');
+    if (sig === sigRatings) return;
+    sigRatings = sig;
     el.innerHTML = list.map(function (w, i) {
       var p = Analysis.getCached(Analysis.workKey(w));
       var key = Analysis.workKey(w);
@@ -896,18 +1149,42 @@
     renderPopularity();
   }
 
+  var sigCharts = '';
   function renderCharts() {
     var pb = snapshot.poolBreakdown;
-    if (pb && pb.dailyTrend && pb.dailyTrend.length) {
-      barChart($('dailyChart'), pb.dailyTrend.map(function (d) { return { label: d.date, value: d.count }; }));
+    var daily = (pb && pb.dailyTrend) || [];
+    var hist = snapshot.history || [];
+    var sig = daily.map(function (d) { return d.date + d.count; }).join(',') + '|' +
+      hist.map(function (h) { return h.wall; }).join(',');
+    if (sig === sigCharts) return;
+    sigCharts = sig;
+    if (daily.length) {
+      barChart($('dailyChart'), daily.map(function (d) { return { label: d.date, value: d.count }; }));
     } else if ($('dailyChart')) {
       $('dailyChart').innerHTML = '<div class="chart-empty">深度扫描进行中…</div>';
     }
-    if ($('trendChart')) lineChart($('trendChart'), snapshot.history || []);
+    if ($('trendChart')) lineChart($('trendChart'), hist);
   }
 
+  var sigBreakdown = '';
   function renderBreakdown() {
     var pb = snapshot.poolBreakdown;
+    var works = snapshot.works || [];
+    /* 标签频次只算一次，签名与渲染共用 */
+    var tags = {};
+    works.forEach(function (w) {
+      if (!w.tags) return;
+      String(w.tags).split(/[、,，/#\s]+/).forEach(function (t) {
+        t = t.trim();
+        if (t && t.length >= 2) tags[t] = (tags[t] || 0) + 1;
+      });
+    });
+    var tagKey = Object.keys(tags).map(function (k) { return k + tags[k]; }).sort().join(',');
+    /* 签名：审核结构 + 平台分布 + 作品数 + 标签频次（作品新增/变化即失效） */
+    var sig = snapshotVersion + '|' + (pb ? [pb.total, JSON.stringify(pb.byStatus || {}), (pb.platforms || []).map(function (p) { return p.name + p.count; }).join(',')].join(',') : '') +
+      '|' + works.length + '|' + tagKey;
+    if (sig === sigBreakdown) return;
+    sigBreakdown = sig;
     var sb = $('statusBars');
     if (sb) {
       if (pb && pb.byStatus) {
@@ -924,7 +1201,7 @@
             '<span class="val num">' + fmtNum(d.v) + '</span></div>';
         }).join('');
         $('poolTotalNote').textContent = '投稿池总量 ' + fmtNum(pb.total) + ' · 深度扫描每 10 分钟';
-        var wallN = (snapshot.works || []).length;
+        var wallN = works.length;
         var noteEl = $('poolCountNote');
         if (noteEl && wallN) {
           noteEl.textContent = '注：作品墙 ' + fmtNum(wallN) + ' 件为官方展示表，与投稿池已通过数口径可能存在差异';
@@ -948,8 +1225,8 @@
     }
     var fb = $('formBars');
     if (fb) {
-      var web = (snapshot.works || []).filter(function (w) { return w.form === '网页应用'; }).length;
-      var mini = (snapshot.works || []).length - web;
+      var web = works.filter(function (w) { return w.form === '网页应用'; }).length;
+      var mini = works.length - web;
       var rows = [
         { k: '网页应用', v: web, c: '' },
         { k: '小程序应用', v: mini, c: 'sig' }
@@ -963,14 +1240,6 @@
     }
     var tl = $('tagList');
     if (tl) {
-      var tags = {};
-      (snapshot.works || []).forEach(function (w) {
-        if (!w.tags) return;
-        String(w.tags).split(/[、,，/#\s]+/).forEach(function (t) {
-          t = t.trim();
-          if (t && t.length >= 2) tags[t] = (tags[t] || 0) + 1;
-        });
-      });
       var top = Object.keys(tags).map(function (k) { return { k: k, v: tags[k] }; })
         .sort(function (a, b) { return b.v - a.v; }).slice(0, 12);
       if (top.length) {
@@ -991,10 +1260,14 @@
       .filter(Boolean).map(function (p) { return p.total; });
   }
 
+  var sigHist = '';
   function renderHistogram() {
     var el = $('histChart');
     if (!el) return;
     var scores = analyzedScores();
+    var sig = scores.slice().sort(function (a, b) { return a - b; }).join(',');
+    if (sig === sigHist) return;
+    sigHist = sig;
     if (scores.length) {
       var avg = (scores.reduce(function (a, b) { return a + b; }, 0) / scores.length).toFixed(1);
       $('histMeta').textContent = scores.length + ' 件已评审 · 均值 ' + avg + ' 分';
@@ -1004,6 +1277,7 @@
     histogram(el, scores);
   }
 
+  var sigPop = '';
   function renderPopularity() {
     var el = $('popList');
     if (!el) return;
@@ -1012,6 +1286,9 @@
       return { w: w, key: Analysis.workKey(w), v: voteCount(Analysis.workKey(w)) };
     }).filter(function (x) { return x.v > 0; });
     scored.sort(function (a, b) { return b.v - a.v; });
+    var sig = voteVersion + '|' + scored.slice(0, 8).map(function (x) { return x.key + x.v; }).join(',');
+    if (sig === sigPop) return;
+    sigPop = sig;
     if (!scored.length) {
       el.innerHTML = '<div class="chart-empty">还没有访客投票。打开作品详情，给你喜欢的作品投票，就会出现在这里。</div>';
       return;
@@ -1143,17 +1420,43 @@
       '<span class="sp"></span>' + links;
   }
 
+  /* 全量作品缓存（详情模态框按需拉取，快照里只有瘦身记录） */
+  var fullWorkCache = {};
+
+  /* 打开详情：优先全量缓存，否则异步拉取（拉取期间展示加载态） */
   function openModal(id) {
-    var w = findWork(id);
-    if (!w) return;
+    var w = fullWorkCache[id];
+    if (w) { paintModal(w); return; }
+    $('modalBody').innerHTML = '<div class="m-loading"><span class="ai-spinner"></span>作品详情加载中…</div>';
+    $('modalFoot').innerHTML = '';
+    $('modalMask').hidden = false;
+    document.body.style.overflow = 'hidden';
+    apiGet('/api/work', { id: id }).then(function (res) {
+      if (res && res.work) {
+        fullWorkCache[id] = res.work;
+        paintModal(res.work);
+      } else {
+        var slim = findWork(id);
+        if (slim) paintModal(slim);
+        else closeModal();
+      }
+    }).catch(function () {
+      var slim2 = findWork(id);
+      if (slim2) paintModal(slim2);
+      else closeModal();
+    });
+  }
+
+  function paintModal(w) {
     var chips = '';
     chips += w.form === '小程序应用' ? '<span class="chip mini">小程序应用</span>' : '<span class="chip web">网页应用</span>';
     if (w.platform) chips += '<span class="chip">' + esc(w.platform) + '</span>';
     if (w.social && w.social.link) chips += '<span class="chip st-approved">已提交社媒分享</span>';
     if (w.tags) chips += '<span class="chip">#' + esc(w.tags) + '</span>';
 
+    /* 截图：点击弹灯箱看大图（不再新开标签页） */
     var shots = (w.shots || []).map(function (s) {
-      return '<a href="' + esc(s.url) + '" target="_blank" rel="noopener"><img src="' + esc(s.url) + '" alt="' + esc(s.title) + '" loading="lazy"></a>';
+      return '<img class="m-shot" data-shot="' + esc(s.url) + '" src="' + esc(s.url) + '" alt="' + esc(s.title) + '" loading="lazy" decoding="async">';
     }).join('');
 
     $('modalBody').innerHTML =
@@ -1168,7 +1471,7 @@
       (w.highlight ? '<div class="m-sec"><h3>一句话亮点</h3><p>' + esc(w.highlight) + '</p></div>' : '') +
       (w.manifesto ? '<div class="m-sec"><h3>我的作品宣言</h3><p>' + esc(w.manifesto) + '</p></div>' : '') +
       (w.desc ? '<div class="m-sec"><h3>作品介绍</h3><p>' + esc(w.desc) + '</p></div>' : '') +
-      (shots ? '<div class="m-sec"><h3>作品截图（' + (w.shots || []).length + '）</h3><div class="m-shots">' + shots + '</div></div>' : '');
+      (shots ? '<div class="m-sec"><h3>作品截图（' + (w.shots || []).length + '）· 点击看大图</h3><div class="m-shots">' + shots + '</div></div>' : '');
     $('modalFoot').innerHTML = drawerFootHtml(w);
     $('modalMask').hidden = false;
     document.body.style.overflow = 'hidden';
@@ -1179,8 +1482,21 @@
     document.body.style.overflow = '';
   }
 
+  /* ---------- 截图灯箱：点击看大图，点空白处 / Esc 关闭 ---------- */
+  function openLightbox(url) {
+    if (!url) return;
+    $('lightboxImg').src = url;
+    $('lightboxMask').hidden = false;
+  }
+
+  function closeLightbox() {
+    $('lightboxMask').hidden = true;
+    $('lightboxImg').src = '';
+  }
+
   function triggerAnalyze(btn) {
-    var w = findWork(btn.getAttribute('data-id'));
+    var wid = btn.getAttribute('data-id');
+    var w = fullWorkCache[wid] || findWork(wid);
     if (!w) return;
     var box = $('aiBox');
     if (box) {
@@ -1340,8 +1656,8 @@
       if (act === 'vote') { toggleVote(id, actEl); return; }
       if (act === 'fav') { toggleFav(id, actEl); return; }
       if (act === 'share') {
-        var w = findWork(id);
-        if (w) shareCard(w).then(function (r) { if (r === 'shared') toast('已调用系统分享'); });
+        var sw = fullWorkCache[id] || findWork(id);
+        if (sw) shareCard(sw).then(function (r) { if (r === 'shared') toast('已调用系统分享'); });
         return;
       }
     }
@@ -1357,6 +1673,9 @@
         }
       }
     }
+    /* 截图灯箱：点击缩略图看大图 */
+    var shotEl = t.closest('[data-shot]');
+    if (shotEl) { openLightbox(shotEl.getAttribute('data-shot')); return; }
     var opener = t.closest('[data-open]');
     if (opener) {
       var oid = opener.getAttribute('data-open');
@@ -1365,14 +1684,24 @@
   });
 
   $('modalMask').addEventListener('click', function (e) { if (e.target === this) closeModal(); });
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+  /* 灯箱：点空白处关闭（点图片本身不关） */
+  $('lightboxMask').addEventListener('click', function (e) { if (e.target === this) closeLightbox(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { closeLightbox(); closeModal(); return; }
+    /* 作品库键盘翻页（输入框聚焦时不拦截） */
+    if (route === 'works' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      var t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+      gotoWorksPage(worksPage + (e.key === 'ArrowRight' ? 1 : -1));
+    }
+  });
   window.addEventListener('hashchange', navigate);
 
   // ------------------------------------------------------------ 启动
   renderCountdown();
-  setInterval(renderCountdown, 1000);
   renderClock();
-  setInterval(renderClock, 1000);
+  /* 秒级定时器合并为一个：倒计时 + 时钟 */
+  setInterval(function () { renderCountdown(); renderClock(); }, 1000);
   loadSnapshot();
   setInterval(loadSnapshot, 30000);
   setInterval(updateAiBadge, 2000);

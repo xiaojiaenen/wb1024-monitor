@@ -58,6 +58,7 @@ const ACTIVITY = {
 const DATA_DIR = path.join(__dirname, 'data');
 const SNAPSHOT_FILE = path.join(DATA_DIR, 'snapshot.json');
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
+const WORKS_FULL_FILE = path.join(DATA_DIR, 'works-full.json'); // 作品全量记录（含长文本/全部截图），供 /api/works 分页与 /api/work 详情
 
 // ---------------------------------------------------------------- 工具
 
@@ -208,6 +209,37 @@ function mapWork(r) {
   };
 }
 
+/** 作品瘦身记录 —— 快照/总览/洞察页用：去掉长文本与多余截图，仅留列表所需字段 */
+function slimWork(w) {
+  return {
+    id: w.id,
+    cardNo: w.cardNo,
+    name: w.name,
+    author: w.author,
+    form: w.form,
+    tags: w.tags,
+    highlight: w.highlight,
+    platform: w.platform,
+    link: w.link,
+    shots: (w.shots || []).slice(0, 1) // 仅首图（缩略图）
+  };
+}
+
+/** 作品列表行记录 —— /api/works 分页用：最小字段集 */
+function worksLight(w) {
+  return {
+    id: w.id,
+    cardNo: w.cardNo,
+    name: w.name,
+    author: w.author,
+    form: w.form,
+    platform: w.platform,
+    highlight: w.highlight,
+    shot: w.shots && w.shots[0] ? w.shots[0].url : '',
+    link: w.link
+  };
+}
+
 /** 投稿池瘦身记录 —— 仅白名单字段，杜绝任何联系信息 */
 function slimPool(r) {
   return {
@@ -229,6 +261,7 @@ function slimPool(r) {
 
 const state = {
   snapshot: null,
+  worksFull: [], // 作品全量记录（内存缓存，/api/works 与 /api/work 的数据源）
   history: [],
   poller: {
     startedAt: new Date().toISOString(),
@@ -264,6 +297,19 @@ function loadPersisted() {
   } catch (e) {
     log('历史文件损坏，忽略', e.message);
   }
+  try {
+    if (fs.existsSync(WORKS_FULL_FILE)) {
+      const w = JSON.parse(fs.readFileSync(WORKS_FULL_FILE, 'utf8'));
+      if (Array.isArray(w)) state.worksFull = w;
+      log('已载入作品全量缓存，作品数:', state.worksFull.length);
+    }
+  } catch (e) {
+    log('作品全量缓存损坏，忽略', e.message);
+  }
+  /* 没有全量缓存时，用旧快照的瘦身作品顶号（缺长文本，首次轮询后会补齐） */
+  if (!state.worksFull.length && state.snapshot && Array.isArray(state.snapshot.works)) {
+    state.worksFull = state.snapshot.works;
+  }
 }
 
 // ---------------------------------------------------------------- 轮询逻辑
@@ -277,6 +323,9 @@ async function fastPoll() {
 
   const works = wallRows.map(mapWork).filter((w) => w.name);
   const recent = recentRows.map(slimPool);
+
+  state.worksFull = works; // 全量进内存缓存（分页接口的数据源）
+  atomicWriteJson(WORKS_FULL_FILE, works);
 
   const prev = state.snapshot || {};
   const prevStats = prev.stats || {};
@@ -318,7 +367,7 @@ async function fastPoll() {
       deltaWall60s: typeof prevStats.wallTotal === 'number' ? wallCount - prevStats.wallTotal : 0,
       deltaPool60s: typeof prevStats.poolTotal === 'number' ? poolCount - prevStats.poolTotal : 0
     }),
-    works,
+    works: works.map(slimWork), // 快照只带瘦身作品（全量走 /api/works 分页）
     recentSubmissions: recent,
     history: state.history.slice(-600)
   });
@@ -488,6 +537,82 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  /* ---------- 作品库分页查询（列表页只拉当前页，不全量） ---------- */
+  if (pathname === '/api/works') {
+    const q = u.searchParams;
+    const per = Math.min(Math.max(parseInt(q.get('per'), 10) || 24, 1), 100);
+    const page = Math.max(1, parseInt(q.get('page'), 10) || 1);
+    const sort = q.get('sort') || 'cardDesc';
+    const idsParam = (q.get('ids') || '').trim();
+    const kw = (q.get('kw') || '').trim().toLowerCase();
+    const form = q.get('form') || '';
+    const platform = q.get('platform') || '';
+
+    /* 筛选（关键词覆盖名称/作者/亮点/标签/宣言/描述，服务端全量内存匹配） */
+    let matched = state.worksFull;
+    if (kw) {
+      matched = matched.filter((w) =>
+        (w.name + ' ' + w.author + ' ' + w.highlight + ' ' + w.tags + ' ' + w.manifesto + ' ' + w.desc)
+          .toLowerCase()
+          .indexOf(kw) >= 0
+      );
+    }
+    if (form) matched = matched.filter((w) => w.form === form);
+    if (platform) matched = matched.filter((w) => w.platform === platform);
+
+    /* 模式 1：仅取 {id, cardNo} 列表（供前端按 AI 评分/人气排序） */
+    if (q.get('only') === 'ids') {
+      const all = matched.slice().sort((a, b) => b.cardNo - a.cardNo);
+      sendJson(res, { total: all.length, ids: all.map((w) => ({ id: w.id, cardNo: w.cardNo })) });
+      return;
+    }
+
+    /* 模式 2：按前端给定的 ID 顺序取当前页（full=1 时返回全量记录，供分析管线补数据） */
+    if (idsParam) {
+      const want = idsParam.split(',').filter(Boolean).slice(0, 200);
+      const byId = {};
+      state.worksFull.forEach((w) => {
+        byId[w.id] = w;
+      });
+      const picked = want.map((id) => byId[id]).filter(Boolean);
+      const full = q.get('full') === '1';
+      sendJson(res, {
+        total: picked.length,
+        works: picked.map((w) => (full ? w : worksLight(w)))
+      });
+      return;
+    }
+
+    /* 模式 3：服务端筛选 + 排序 + 分页 */
+    const sorted = matched.slice().sort((a, b) => {
+      if (sort === 'cardAsc') return a.cardNo - b.cardNo;
+      if (sort === 'name') return String(a.name).localeCompare(String(b.name), 'zh');
+      return b.cardNo - a.cardNo; // cardDesc（默认）
+    });
+    const total = sorted.length;
+    const start = (page - 1) * per;
+    sendJson(res, {
+      total,
+      page,
+      per,
+      pages: Math.max(1, Math.ceil(total / per)),
+      works: sorted.slice(start, start + per).map(worksLight)
+    });
+    return;
+  }
+
+  /* ---------- 单件作品全量（详情模态框按需拉取） ---------- */
+  if (pathname === '/api/work') {
+    const wid = u.searchParams.get('id') || '';
+    const found = state.worksFull.find((w) => w.id === wid);
+    if (!found) {
+      sendJson(res, { error: 'not found' });
+      return;
+    }
+    sendJson(res, { work: found });
+    return;
+  }
+
   // 调试端点：接收前端探针日志，追加落盘（仅本地开发排查用）
   if (pathname === '/_debug/log') {
     let body = '';
@@ -545,6 +670,7 @@ server.listen(PORT, HOST, () => {
 process.on('SIGTERM', () => {
   log('收到 SIGTERM，保存状态后退出');
   if (state.snapshot) atomicWriteJson(SNAPSHOT_FILE, state.snapshot);
+  if (state.worksFull.length) atomicWriteJson(WORKS_FULL_FILE, state.worksFull);
   atomicWriteJson(HISTORY_FILE, state.history);
   process.exit(0);
 });

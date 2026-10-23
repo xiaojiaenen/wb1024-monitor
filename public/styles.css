@@ -214,13 +214,17 @@ table.board tr.sel .pop, table.board tr.sel .pop b { color: var(--sel-sub); }
   background: var(--ink); color: var(--bg);
   font-family: var(--font-disp); font-size: 12px; letter-spacing: .14em; flex-shrink: 0;
 }
-.ticker .track { flex: 1; display: flex; align-items: center; overflow: hidden; }
+.ticker .track { flex: 1; overflow: hidden; }
+.tick-rail {
+  display: flex; align-items: center; width: max-content;
+  animation: marquee 75s linear infinite; will-change: transform;
+}
+.ticker:hover .tick-rail { animation-play-state: paused; }
+@keyframes marquee { from { transform: translateX(0); } to { transform: translateX(-50%); } }
 .tick-item {
   display: flex; align-items: center; gap: 9px; padding: 0 16px;
   border-right: 1px solid var(--hair); flex-shrink: 0;
-  animation: slidein .5s; max-width: 100%;
 }
-@keyframes slidein { from { transform: translateX(24px); opacity: 0; } }
 .tick-item .nm { font-size: 12px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
 .tick-item .au { font-size: 12px; color: var(--muted); white-space: nowrap; }
 .tick-item .st { font-size: 12px; padding: 1.5px 8px; border: 1px solid; letter-spacing: .08em; white-space: nowrap; }
@@ -310,7 +314,7 @@ select.input { cursor: pointer; }
 .btn.sm { padding: 4px 12px; font-size: 12px; }
 
 .table-wrap { overflow: auto; flex: 1; min-height: 0; }
-table.works { width: 100%; border-collapse: collapse; }
+table.works { width: 100%; border-collapse: collapse; table-layout: fixed; }
 table.works th {
   text-align: left; font-family: var(--font-disp); font-size: 12px; font-weight: 500;
   letter-spacing: .12em; color: var(--muted); padding: 8px 10px;
@@ -321,7 +325,11 @@ table.works tr { cursor: pointer; }
 table.works tr:hover td { background: var(--hover); }
 table.works .shot { width: 72px; height: 44px; object-fit: cover; display: block; background: #EDEAE2; border: 1px solid var(--hair); }
 table.works .shot-ph { width: 72px; height: 44px; background: #EDEAE2; border: 1px solid var(--hair); display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--muted); }
-table.works .w-name { font-weight: 700; }
+table.works .c-shot { width: 84px; }
+table.works .c-plat .chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+table.works .c-au { overflow: hidden; }
+table.works .w-au { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.works .w-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 table.works .w-hl { font-size: 12px; color: var(--muted); margin-top: 1px; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 table.works .no { font-family: var(--font-disp); font-weight: 600; font-size: 15px; font-variant-numeric: tabular-nums; }
 table.works .c-no { width: 44px; }
@@ -361,9 +369,26 @@ table.works .c-link { width: 72px; }
 .link-btn.disabled:hover { background: transparent; color: var(--muted); }
 
 .table-foot {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 10px 12px; border-top: 1px solid var(--hair); flex-shrink: 0;
-  font-size: 12px; color: var(--muted);
+  font-size: 12px; color: var(--muted); flex-wrap: wrap;
+}
+
+/* 分页器 */
+.pager { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.pager .pg-btn {
+  font-family: var(--font-disp); font-size: 12px; letter-spacing: .03em;
+  min-width: 28px; padding: 3px 8px; border: 1px solid var(--hair);
+  background: transparent; color: var(--ink); cursor: pointer;
+}
+.pager .pg-btn:hover:not(:disabled):not(.on) { border-color: var(--ink); }
+.pager .pg-btn.on { background: var(--ink); color: var(--bg); border-color: var(--ink); cursor: default; }
+.pager .pg-btn:disabled { color: var(--hair-strong, #C4BFB2); cursor: default; }
+.pager .pg-ell { font-size: 12px; color: var(--muted); padding: 0 2px; }
+.pager .pg-per { display: flex; align-items: center; gap: 5px; margin-left: 6px; }
+.pager .pg-per select {
+  font-size: 12px; padding: 2px 4px; border: 1px solid var(--hair);
+  background: transparent; color: var(--ink); font-family: var(--font-disp);
 }
 
 /* ============================================================ 实时动态 */
@@ -448,6 +473,17 @@ table.works .c-link { width: 72px; }
   z-index: 50; display: flex; justify-content: flex-end;
 }
 .mask[hidden] { display: none; }
+/* 截图灯箱：深色遮罩 + 居中大图，点空白处关闭 */
+.lightbox {
+  background: rgba(18, 16, 13, .93); z-index: 100;
+  display: flex; align-items: center; justify-content: center; cursor: zoom-out;
+}
+.lightbox img {
+  max-width: 92vw; max-height: 90vh; display: block; cursor: default;
+  border: 1px solid rgba(255, 255, 255, .14); box-shadow: 0 18px 60px rgba(0, 0, 0, .5);
+  animation: lb-in .18s ease;
+}
+@keyframes lb-in { from { transform: scale(.96); opacity: 0; } }
 .drawer {
   width: min(580px, 100%); height: 100%; background: var(--bg);
   border-left: 1px solid var(--ink); display: flex; flex-direction: column;
@@ -486,8 +522,12 @@ table.works .c-link { width: 72px; }
 }
 .m-sec p { font-size: 14px; line-height: 1.7; }
 .m-shots { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.m-shots a { border: 1px solid var(--hair); display: block; }
-.m-shots img { width: 100%; display: block; }
+.m-shot {
+  width: 100%; display: block; border: 1px solid var(--hair);
+  cursor: zoom-in; background: #EDEAE2; transition: border-color .15s;
+}
+.m-shot:hover { border-color: var(--ink); }
+.m-loading { display: flex; align-items: center; gap: 10px; padding: 40px 16px; font-size: 14px; color: var(--muted); }
 .m-links { display: flex; gap: 8px; padding: 14px 16px 18px; flex-wrap: wrap; }
 
 .vote-btn, .fav-btn { position: relative; }
@@ -546,6 +586,7 @@ table.works .c-link { width: 72px; }
   .filters { flex-direction: column; }
   #fKeyword { min-width: 0; }
   table.works .c-plat, table.works .w-hl { display: none; }
+  table.works { table-layout: auto; } /* 窄屏退回自动布局，避免固定列宽挤压 */
   .d-head h1 { font-size: 21px; }
 }
 

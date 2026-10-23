@@ -205,6 +205,32 @@
     return res.count || 0;
   }
 
+  /* 一次性拉取全部分析评分（作品库 AI 排序用）：work_id(cardNo) -> total */
+  async function dbSelectAllAnalysisScores() {
+    var c = getCloud();
+    var res = await c.database.from('analyses').select('work_id,payload');
+    if (res.error) throw res.error;
+    var map = {};
+    (res.data || []).forEach(function (row) {
+      var p = row.payload;
+      if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = null; } }
+      if (p && typeof p.total === 'number') map[String(row.work_id)] = p.total;
+    });
+    return map;
+  }
+
+  /* 一次性拉取全部分析完整记录（启动时填充内存缓存，榜单/评分立即可见） */
+  async function dbSelectAllAnalyses() {
+    var c = getCloud();
+    var res = await c.database.from('analyses').select('work_id,payload');
+    if (res.error) throw res.error;
+    return (res.data || []).map(function (row) {
+      var p = row.payload;
+      if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = null; } }
+      return { work_id: String(row.work_id), payload: p };
+    }).filter(function (r) { return r.payload; });
+  }
+
   /* ---------- 互动：投票 / 收藏 ---------- */
 
   async function dbVote(workId, voterId) {
@@ -266,6 +292,8 @@
     dbSelectAnalysis: dbSelectAnalysis,
     dbSaveAnalysis: dbSaveAnalysis,
     dbCountAnalyses: dbCountAnalyses,
+    dbSelectAllAnalysisScores: dbSelectAllAnalysisScores,
+    dbSelectAllAnalyses: dbSelectAllAnalyses,
     dbVote: dbVote,
     dbUnvote: dbUnvote,
     dbFavorite: dbFavorite,

@@ -227,8 +227,22 @@
     return null;
   }
 
+  /* 启动 hydration：一次性把数据库里的全部分析灌进内存缓存，
+   * 榜单/评分/KPI 立即可见，不必等预热窗口轮到旧作品 */
+  async function hydrateFromDb() {
+    try {
+      var rows = await Cloud.dbSelectAllAnalyses();
+      rows.forEach(function (r) {
+        if (!memCache[r.work_id]) memCache[r.work_id] = r.payload;
+      });
+      if (rows.length) console.log('已从数据库 hydration 分析缓存:', rows.length, '条');
+    } catch (e) {
+      console.warn('分析缓存 hydration 失败（不影响后续预热）', e);
+    }
+  }
+
   /* 后台预热：只补数据库里没有的最新作品 */
-  async function warmLatest(works) {
+  async function warmLatest(works, hydrate) {
     if (!works || !works.length) return;
     var latest = works.slice(0, WARM_COUNT);
     var missing = [];
@@ -241,6 +255,22 @@
         else missing.push(latest[i]);
       } catch (e) {
         missing.push(latest[i]); /* 查库失败也试着分析 */
+      }
+    }
+    /* 补拉全量记录：AI prompt 需要 desc/manifesto/social（快照里的作品已瘦身） */
+    if (missing.length && typeof hydrate === 'function') {
+      try {
+        var full = [];
+        for (var i = 0; i < missing.length; i += 40) {
+          var batch = missing.slice(i, i + 40).map(function (w) { return w.id; });
+          var rows = await hydrate(batch);
+          full = full.concat(rows || []);
+        }
+        var byId = {};
+        full.forEach(function (w) { byId[w.id] = w; });
+        missing = missing.map(function (w) { return byId[w.id] || w; });
+      } catch (e) {
+        console.warn('作品全量补拉失败，用瘦身记录继续', e);
       }
     }
     missing.forEach(function (w) {
@@ -262,6 +292,7 @@
   global.Analysis = {
     analyze: analyze,
     warmLatest: warmLatest,
+    hydrateFromDb: hydrateFromDb,
     getCached: getCached,
     getStats: getStats,
     workKey: workKey
