@@ -393,6 +393,14 @@ table.works .c-link { width: 72px; }
 
 /* ============================================================ 实时动态 */
 
+.feed-tabs { display: flex; gap: 6px; flex-shrink: 0; }
+.feed-tab {
+  border: 1px solid var(--hair); background: transparent; color: var(--muted);
+  font: inherit; font-size: 12px; padding: 3px 12px; border-radius: 999px; cursor: pointer;
+}
+.feed-tab:hover { border-color: var(--ink); color: var(--ink); }
+.feed-tab.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+
 .stream { list-style: none; }
 .stream li {
   display: grid; grid-template-columns: 64px 1fr 130px 84px; gap: 10px;

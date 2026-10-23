@@ -1304,10 +1304,17 @@
   }
 
   // ============================================================ 页面：实时动态
+  var feedFilter = ''; /* 动态页状态筛选：'' 全部 / 待审核 / 已通过 / 已驳回 */
   function renderFeedPage() {
     $('page').innerHTML =
       '<div class="panel">' +
-      '<div class="panel-h"><h2>最新投稿流水</h2><div class="rule"></div><span class="panel-note meta">投稿池按提交时间倒序 · 每 60 秒同步 · 点击行查看详情</span></div>' +
+      '<div class="panel-h"><h2>最新投稿流水</h2><div class="rule"></div>' +
+      '<span class="feed-tabs" id="feedTabs">' +
+        '<button class="feed-tab on" data-fst="">全部</button>' +
+        '<button class="feed-tab" data-fst="待审核">待审核</button>' +
+        '<button class="feed-tab" data-fst="已通过">已通过</button>' +
+        '<button class="feed-tab" data-fst="已驳回">已驳回</button>' +
+      '</span></div>' +
       '<ul class="stream" id="recentStream"></ul></div>';
     renderStream();
   }
@@ -1315,15 +1322,18 @@
   function renderStream() {
     var el = $('recentStream');
     if (!el) return;
-    var list = snapshot.recentSubmissions || [];
+    var all = snapshot.recentSubmissions || [];
+    var list = feedFilter ? all.filter(function (r) { return r.status === feedFilter; }) : all;
     var statusMap = { '待审核': 'st-pending', '已通过': 'st-approved', '已驳回': 'st-rejected' };
+    var tabs = document.querySelectorAll('#feedTabs .feed-tab');
+    for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('on', tabs[i].getAttribute('data-fst') === feedFilter);
     if (!list.length) {
-      el.innerHTML = '<li style="cursor:default;color:var(--muted)">投稿流水采集中…</li>';
+      el.innerHTML = '<li style="cursor:default;color:var(--muted)">' + (all.length ? '该状态下暂无记录' : '投稿流水采集中…') + '</li>';
       return;
     }
     el.innerHTML = list.map(function (r) {
       var t = (r.submittedAt || '').slice(5);
-      return '<li data-open="' + esc(r.id || '') + '">' +
+      return '<li data-feed="' + esc(r.id || '') + '">' +
         '<span class="s-time">' + esc(t) + '</span>' +
         '<span class="s-name">' + esc(r.name) + (r.highlight ? '<span class="hl">' + esc(r.highlight) + '</span>' : '') + '</span>' +
         '<span class="s-author">@' + esc(r.author) + '</span>' +
@@ -1480,6 +1490,30 @@
   function closeModal() {
     $('modalMask').hidden = true;
     document.body.style.overflow = '';
+  }
+
+  /* 投稿池记录详情：未上架的投稿没有作品页，直接展示投稿信息 */
+  function paintSubmissionModal(r) {
+    var stMap = { '待审核': 'st-pending', '已通过': 'st-approved', '已驳回': 'st-rejected' };
+    $('modalBody').innerHTML =
+      '<div class="m-head">' +
+        '<span class="m-no">' + esc(r.sid || '投稿') + '</span>' +
+        '<div><div class="m-title">' + esc(r.name) + '</div>' +
+        '<div class="m-author">作者：' + esc(r.author) + ' · ' + esc(r.form || '–') + '</div></div>' +
+        '<button class="m-close" data-act="close" aria-label="关闭">✕</button>' +
+      '</div>' +
+      '<div class="m-chips">' +
+        '<span class="chip ' + (stMap[r.status] || '') + '">' + esc(r.status) + '</span>' +
+        (r.cardNo != null ? '<span class="chip">已上架 · 卡片号 #' + r.cardNo + '</span>' : '') +
+        (r.platform ? '<span class="chip">' + esc(r.platform) + '</span>' : '') +
+      '</div>' +
+      (r.highlight ? '<div class="m-sec"><h3>一句话亮点</h3><p>' + esc(r.highlight) + '</p></div>' : '') +
+      '<div class="m-sec"><h3>投稿信息</h3><p>提交时间：' + esc((r.submittedAt || '').slice(0, 19)) + '</p></div>' +
+      (r.status === '待审核' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿正在等待官方审核，通过后将出现在作品墙并获得卡片号。</p></div>' : '') +
+      (r.status === '已驳回' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿未通过官方审核，未上架作品墙。</p></div>' : '');
+    $('modalFoot').innerHTML = '';
+    $('modalMask').hidden = false;
+    document.body.style.overflow = 'hidden';
   }
 
   /* ---------- 截图灯箱：点击看大图，点空白处 / Esc 关闭 ---------- */
@@ -1676,6 +1710,25 @@
     /* 截图灯箱：点击缩略图看大图 */
     var shotEl = t.closest('[data-shot]');
     if (shotEl) { openLightbox(shotEl.getAttribute('data-shot')); return; }
+    /* 动态页投稿行：已上架的跳作品完整详情，其余展示投稿信息 */
+    var feedEl = t.closest('[data-feed]');
+    if (feedEl) {
+      var fid = feedEl.getAttribute('data-feed');
+      var sub = null;
+      (snapshot.recentSubmissions || []).forEach(function (r) { if (r.id === fid) sub = r; });
+      if (sub) {
+        if (sub.cardNo != null) {
+          var fw = null;
+          (snapshot.works || []).forEach(function (w) { if (w.cardNo === sub.cardNo) fw = w; });
+          if (fw) { openModal(fw.id); return; }
+        }
+        paintSubmissionModal(sub);
+      }
+      return;
+    }
+    /* 投稿流水状态筛选 */
+    var fstEl = t.closest('[data-fst]');
+    if (fstEl) { feedFilter = fstEl.getAttribute('data-fst'); renderStream(); return; }
     var opener = t.closest('[data-open]');
     if (opener) {
       var oid = opener.getAttribute('data-open');
