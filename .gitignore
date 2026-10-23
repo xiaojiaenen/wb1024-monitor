@@ -11,3 +11,6 @@ Thumbs.db
 
 # WorkBuddy 工作区数据
 .workbuddy/
+
+# 设计探索过程产物（三方向初稿/截图/修复脚本）不入库
+design-demos/
