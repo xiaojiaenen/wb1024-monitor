@@ -17,3 +17,4 @@ design-demos/
 
 # 调试产物（DOM dump / 截图）不入库
 *.tmp
+llm-smoke/tmp/
