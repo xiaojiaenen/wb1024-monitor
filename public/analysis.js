@@ -1,7 +1,9 @@
 /* ============================================================
  * analysis.js — 作品 AI 分析管线
- * 流程：内存缓存 → 云数据库缓存 → 顺序队列调 LLM → 结果落库
+ * 流程：内存缓存 → 云数据库缓存 → 批量顺序队列调 LLM → 结果落库
  * 策略：懒加载（详情打开才分析）+ 后台预热最新 N 件 + 全量缓存不重复调用
+ * 批量：每 BATCH_SIZE 件一次 LLM 调用（results 数组分发），摊薄 system prompt
+ *       与每件固定开销；批量缺失/整批失败自动降级逐个重试，单件不丢
  * ============================================================ */
 (function (global) {
   'use strict';
@@ -25,7 +27,8 @@
 
   var RUBRIC = '评分细则（百分制，与官方评审对齐）：创意与场景价值 creativity 满分35（新颖性、痛点真实度）；作品完成度 completeness 满分40（功能完整、能跑、细节）；使用体验 experience 满分25（易用、美观、流畅）；社媒潜力 social_potential 满分30（话题性、可分享性，仅参考不计入总分）。total 为前三项之和。';
 
-  var MIN_INTERVAL_MS = 1200;   /* 两次 LLM 调用最小间隔，防止配额被瞬间打满 */
+  var BATCH_SIZE = 6;           /* 每批 LLM 调用的作品数：一次调用分析多件 */
+  var MIN_INTERVAL_MS = 800;    /* 两批之间的最小间隔，防止配额被瞬间打满 */
   var WARM_COUNT = 60;          /* 后台预热最新作品数 */
   var MAX_QUEUE = 200;
 
@@ -97,38 +100,115 @@
     return JSON.parse(raw.slice(start, end + 1));
   }
 
+  /* 批量 prompt：一次分析多件，results 数组按 work_id 分发 */
+  function buildBatchPrompt(works) {
+    var list = works.map(function (w) {
+      return {
+        work_id: workKey(w),
+        名称: w.name,
+        作者: w.author,
+        作品形态: w.form,
+        一句话亮点: w.highlight || '',
+        我的作品宣言: w.manifesto || '',
+        原文描述: (w.desc || '').slice(0, 600),
+        体验链接: w.link || '',
+        社媒分享链接: w.social || ''
+      };
+    });
+    return '请分析以下 ' + list.length + ' 件参赛作品。\n' +
+      '严格输出 JSON：{"results": [{"work_id": "<该作品的 work_id>", ' + JSON.stringify(SCHEMA_HINT).slice(1, -1) + ']}\n' +
+      'results 必须且只能包含全部 ' + list.length + ' 件作品，work_id 必须原样使用输入的 work_id，不得编造或遗漏。\n\n' +
+      RUBRIC + '\n\n作品列表：\n' + JSON.stringify(list, null, 2);
+  }
+
+  /* 解析批量结果：返回 work_id -> 原始 payload 的映射 */
+  function parseBatchAnswer(text) {
+    var raw = String(text || '').trim();
+    raw = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+    var start = raw.indexOf('{');
+    var end = raw.lastIndexOf('}');
+    if (start < 0 || end <= start) throw new Error('模型未返回 JSON');
+    var json = JSON.parse(raw.slice(start, end + 1));
+    var arr = Array.isArray(json) ? json : (json.results || json.works || json.items || null);
+    if (!Array.isArray(arr) || !arr.length) throw new Error('批量结果为空或结构不符');
+    var map = {};
+    arr.forEach(function (r) {
+      if (r && r.work_id != null) map[String(r.work_id)] = r;
+    });
+    return map;
+  }
+
+  /* 完成单件分析：清洗 → 内存缓存 → 落库 → 回调 */
+  function finishJob(job, raw) {
+    var key = workKey(job.work);
+    var payload = sanitize(raw);
+    memCache[key] = payload;
+    Cloud.dbSaveAnalysis({
+      work_id: key,
+      work_name: job.work.name || '',
+      payload: payload,
+      model: global.__aiModel || 'step-5-preview'
+    }).catch(function (dbErr) {
+      console.warn('分析结果落库失败（内存缓存仍可用）', dbErr);
+    });
+    stats.done++;
+    if (typeof job.onDone === 'function') job.onDone(payload, null);
+  }
+
   async function runQueue() {
     if (running) return;
     running = true;
     while (queue.length) {
-      var job = queue.shift();
+      var batch = queue.splice(0, BATCH_SIZE);
       stats.queued = queue.length;
-      var work = job.work;
-      var key = workKey(work);
+      var missing = [];
       try {
         /* 节流 */
         var wait = MIN_INTERVAL_MS - (Date.now() - lastCallAt);
         if (wait > 0) await new Promise(function (r) { setTimeout(r, wait); });
         lastCallAt = Date.now();
-        var text = await Cloud.chatOnce(SYSTEM_PROMPT, buildUserPrompt(work), { json: true });
-        var payload = sanitize(parseAnswer(text));
-        memCache[key] = payload;
-        try {
-          await Cloud.dbSaveAnalysis({
-            work_id: key,
-            work_name: work.name || '',
-            payload: payload,
-            model: await Cloud.getModelId()
-          });
-        } catch (dbErr) {
-          console.warn('分析结果落库失败（内存缓存仍可用）', dbErr);
-        }
-        stats.done++;
-        if (typeof job.onDone === 'function') job.onDone(payload, null);
+        var text = await Cloud.chatOnce(SYSTEM_PROMPT, buildBatchPrompt(batch.map(function (j) { return j.work; })),
+          { json: true, maxTokens: 8192 });
+        var map = parseBatchAnswer(text);
+        batch.forEach(function (job) {
+          var key = workKey(job.work);
+          var payload = map[key] != null ? map[key] : map[String(job.work.id)];
+          if (payload) finishJob(job, payload);
+          else missing.push(job);
+        });
+        if (missing.length) console.warn('批量结果缺失 ' + missing.length + ' 件，逐个补跑');
       } catch (e) {
-        stats.failed++;
-        console.warn('分析失败', key, e);
-        if (typeof job.onDone === 'function') job.onDone(null, e);
+        if (e && e.paused) {
+          /* 全部免费模型暂不可用：整批回退，睡到恢复时间再继续 */
+          queue = batch.concat(queue);
+          stats.queued = queue.length;
+          console.warn('模型暂停中，30 分钟后自动重试；队列保留', queue.length, '件');
+          await new Promise(function (r) { setTimeout(r, Math.max(1000, e.retryAt - Date.now() + 1000)); });
+          continue;
+        }
+        console.warn('批量分析失败，降级逐个重试', e);
+        missing = batch.slice();
+      }
+      /* 批量缺失或整批失败：逐个重试，保证单件不丢 */
+      for (var i = 0; i < missing.length; i++) {
+        var mjob = missing[i];
+        try {
+          var wait2 = MIN_INTERVAL_MS - (Date.now() - lastCallAt);
+          if (wait2 > 0) await new Promise(function (r) { setTimeout(r, wait2); });
+          lastCallAt = Date.now();
+          var t = await Cloud.chatOnce(SYSTEM_PROMPT, buildUserPrompt(mjob.work), { json: true, maxTokens: 4096 });
+          finishJob(mjob, parseAnswer(t));
+        } catch (e2) {
+          if (e2 && e2.paused) {
+            /* 剩余未处理的回退队列，等外层统一等待恢复 */
+            queue = missing.slice(i).concat(queue);
+            stats.queued = queue.length;
+            break;
+          }
+          stats.failed++;
+          console.warn('分析失败', workKey(mjob.work), e2);
+          if (typeof mjob.onDone === 'function') mjob.onDone(null, e2);
+        }
       }
     }
     running = false;

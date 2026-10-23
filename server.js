@@ -8,8 +8,8 @@
  *   - 投稿收集池 P3Y1rSDQcUAZcGV15UjCND  全部投稿（含待审核/已通过/已驳回）
  *
  * 隐私边界：
- *   - 0m6Oh74DwQEU2Kg5n6oN2P 为提交者联系信息隐私表（只写不读），
- *     本服务在任何代码路径下均不查询、不转发该表。
+ *   - 活动另设提交者联系信息隐私表（只写不读），本服务在任何代码路径下
+ *     均不查询、不转发该表（ID 不落代码，避免开源仓库暴露内部标识）。
  *   - 投稿池记录仅提取白名单字段，截留任何可能的联系信息。
  *
  * 轮询策略：
@@ -34,7 +34,7 @@ const UPSTREAM_BASE = 'https://www.workbuddy.link/space/api/page/share';
 const PAGE_ID = '8QYARuAmZ9RgQty3FSzNUs'; // 官方活动发布页节点 ID
 const DB_WALL = 'Sf9WvoEghtTHglyQACWKC5'; // 作品墙表
 const DB_POOL = 'P3Y1rSDQcUAZcGV15UjCND'; // 投稿收集池
-// 隐私表 DB_CONTACT = '0m6Oh74DwQEU2Kg5n6oN2P' —— 严禁访问，不写入任何配置
+// 另有提交者联系信息隐私表（只写不读）——本项目严禁访问，不写入任何配置
 
 const FAST_POLL_MS = parseInt(process.env.FAST_POLL_MS, 10) || 60 * 1000;
 const DEEP_POLL_MS = parseInt(process.env.DEEP_POLL_MS, 10) || 10 * 60 * 1000;

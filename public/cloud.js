@@ -14,14 +14,22 @@
   };
 
   var SDK_URL = 'https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js';
-  var FALLBACK_MODEL = 'glm-5.3-flash'; /* models.list 为空或异常时的首选；实测 auto 路由慢模型会超时，不采用 */
-  /* 按优先级挑选：step-5-preview 为默认（免费 x0.00 积分，分析质量最高，约 37s/件）；
-   * 若其不可用按序降级到实测可用模型（glm-5.3-flash 完整分析约 10s） */
-  var PREFERRED_MODELS = ['step-5-preview', 'glm-5.3-flash', 'deepseek-v4-flash', 'hunyuan-chat'];
+  /* ---------- 免费模型调度 ----------
+   * step-5-preview / hy3：全天免费（x0.00 积分），默认主力
+   * hy4-preview：仅夜间 23:00–次日 08:00 活动免费窗口（9/11–10/31），夜间优先
+   * 策略：按候选顺序尝试，单个失败自动切换下一个；全部不可用则暂停 30 分钟后重试 */
+  var FREE_ALL_DAY = ['step-5-preview', 'hy3'];
+  var NIGHT_MODELS = ['hy4-preview'];
+  var NIGHT_HOURS = [23, 8];        /* 夜间免费窗口 [起, 止)，跨零点 */
+  var PAUSE_MS = 30 * 60 * 1000;    /* 全部模型不可用后的暂停时长 */
+  var MODELS_CACHE_MS = 5 * 60 * 1000;
 
   var cloud = null;
   var sdkPromise = null;
-  var modelId = null;
+  var modelsCache = null;
+  var modelsCacheAt = 0;
+  var modelFailedAt = {};   /* modelId -> 失败时间戳（成功即清除） */
+  var pausedUntil = 0;      /* 全部候选失败后的暂停截止时间 */
 
   function loadSDK() {
     if (global.WorkBuddyCloud) return Promise.resolve(global.WorkBuddyCloud);
@@ -51,32 +59,66 @@
     return cloud;
   }
 
-  /* 取模型 id：优先 PREFERRED_MODELS 中列表存在的第一个；否则首个可用；再不行用内置首选 */
-  async function getModelId() {
-    if (modelId) return modelId;
-    var c = getCloud();
-    try {
-      var models = await c.llm.models.list();
-      var usable = (models || []).filter(function (m) { return m.disabled !== true; });
-      for (var i = 0; i < PREFERRED_MODELS.length; i++) {
-        if (usable.some(function (m) { return m.id === PREFERRED_MODELS[i]; })) {
-          modelId = PREFERRED_MODELS[i];
-          break;
-        }
-      }
-      if (!modelId && usable.length) modelId = usable[0].id;
-    } catch (e) {
-      console.warn('models.list 失败，使用内置模型', e);
-    }
-    if (!modelId) modelId = FALLBACK_MODEL;
-    global.__aiModel = modelId;
-    return modelId;
+  /* 当前是否处于夜间免费窗口（23:00–08:00） */
+  function isNightWindow() {
+    var h = new Date().getHours();
+    return h >= NIGHT_HOURS[0] || h < NIGHT_HOURS[1];
   }
 
-  /* 一次性对话：流式收集全文。system 必须为 messages[0] */
-  async function chatOnce(system, user, opts) {
+  /* 拉取模型列表（带 5 分钟缓存）；失败或空列表返回 null（视为无信息，用内置候选） */
+  async function fetchModels() {
+    if (modelsCache && Date.now() - modelsCacheAt < MODELS_CACHE_MS) return modelsCache;
+    try {
+      var list = await getCloud().llm.models.list();
+      modelsCache = (list && list.length) ? list : null;
+      modelsCacheAt = Date.now();
+    } catch (e) {
+      console.warn('models.list 失败，使用内置候选', e);
+      return null;
+    }
+    return modelsCache;
+  }
+
+  /* 按当前时间窗口组装候选模型顺序：夜间 hy4 优先，白天 step-5 优先 */
+  async function getCandidates() {
+    /* 清理 10 分钟前的失败记录，让恢复的模型重新参与竞争，避免粘性失败 */
+    var now = Date.now();
+    Object.keys(modelFailedAt).forEach(function (id) {
+      if (now - modelFailedAt[id] > 10 * 60 * 1000) delete modelFailedAt[id];
+    });
+    var list = await fetchModels();
+    var usable = (list || []).filter(function (m) { return m.disabled !== true; });
+    var order = isNightWindow() ? NIGHT_MODELS.concat(FREE_ALL_DAY) : FREE_ALL_DAY.slice();
+    var ids = usable.map(function (m) { return m.id; });
+    var picked = order.filter(function (id) { return !list || ids.indexOf(id) >= 0; });
+    /* 内置候选都不在列表里（如活动结束下架）时，自动发现列表中的全天免费模型 */
+    if (!picked.length && usable.length) {
+      picked = usable.filter(function (m) { return /^x0\.00/.test(String(m.credits || '')); })
+        .map(function (m) { return m.id; });
+    }
+    /* 最近失败过的排到后面，给恢复中的模型让位 */
+    picked.sort(function (a, b) {
+      return (modelFailedAt[a] || 0) - (modelFailedAt[b] || 0);
+    });
+    return picked;
+  }
+
+  /* 当前首选模型（供展示） */
+  async function getModelId() {
+    var c = await getCandidates();
+    return c.length ? c[0] : null;
+  }
+
+  function pausedError(retryAt) {
+    var e = new Error('免费模型额度暂不可用，已暂停，' + new Date(retryAt).toLocaleTimeString('zh-CN') + ' 自动重试');
+    e.paused = true;
+    e.retryAt = retryAt;
+    return e;
+  }
+
+  /* 单模型原始调用：流式收集全文 */
+  async function rawChat(model, system, user, opts) {
     var c = getCloud();
-    var model = opts && opts.model ? opts.model : await getModelId();
     var answer = '';
     var iter = c.llm.chat.completions.create({
       model: model,
@@ -86,6 +128,7 @@
       ],
       stream: true,
       temperature: (opts && typeof opts.temperature === 'number') ? opts.temperature : 0.3,
+      ...(opts && typeof opts.maxTokens === 'number' ? { max_tokens: opts.maxTokens } : {}),
       ...(opts && opts.json ? { response_format: { type: 'json_object' } } : {})
     });
     for await (var chunk of iter) {
@@ -93,6 +136,48 @@
       if (d) answer += d;
     }
     return answer;
+  }
+
+  /* 一次性对话：候选模型依序尝试，失败自动切换；全部失败暂停 PAUSE_MS。
+   * opts.model 强制指定时直连该模型，不参与调度 */
+  async function chatOnce(system, user, opts) {
+    if (opts && opts.model) return rawChat(opts.model, system, user, opts);
+    if (pausedUntil > Date.now()) throw pausedError(pausedUntil);
+    var candidates = await getCandidates();
+    if (!candidates.length) {
+      pausedUntil = Date.now() + PAUSE_MS;
+      throw pausedError(pausedUntil);
+    }
+    var lastErr = null;
+    for (var i = 0; i < candidates.length; i++) {
+      var id = candidates[i];
+      try {
+        var text = await rawChat(id, system, user, opts);
+        delete modelFailedAt[id];
+        global.__aiModel = id;
+        return text;
+      } catch (e) {
+        modelFailedAt[id] = Date.now();
+        lastErr = e;
+        console.warn('模型不可用，切换下一个候选', id, e && e.message);
+      }
+    }
+    pausedUntil = Date.now() + PAUSE_MS;
+    var err = lastErr || new Error('所有候选模型均不可用');
+    err.paused = true;
+    err.retryAt = pausedUntil;
+    throw err;
+  }
+
+  /* 调度状态（供前端展示） */
+  async function getModelStatus() {
+    var candidates = await getCandidates();
+    return {
+      model: candidates.length ? candidates[0] : null,
+      candidates: candidates,
+      night: isNightWindow(),
+      pausedUntil: pausedUntil > Date.now() ? pausedUntil : null
+    };
   }
 
   /* ---------- 数据库 ---------- */
@@ -176,6 +261,7 @@
     loadSDK: loadSDK,
     getCloud: getCloud,
     getModelId: getModelId,
+    getModelStatus: getModelStatus,
     chatOnce: chatOnce,
     dbSelectAnalysis: dbSelectAnalysis,
     dbSaveAnalysis: dbSaveAnalysis,

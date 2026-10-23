@@ -758,7 +758,7 @@
     $('page').innerHTML =
       '<div class="row" style="height:calc(100vh - 150px);min-height:480px">' +
         '<div class="panel grow" style="flex:1">' +
-          '<div class="panel-h"><h2>评审排行</h2><div class="rule"></div><span class="meta" id="ratingsCount"></span></div>' +
+          '<div class="panel-h"><h2>评审排行</h2><div class="rule"></div><span class="meta" id="ratingsCount"></span><span class="meta" id="modelTag" style="margin-left:10px"></span></div>' +
           '<div class="board-wrap"><table class="board" id="boardFull"></table></div>' +
         '</div>' +
         '<div class="panel detail grow" style="flex:1.15"><div class="detail-scroll" id="ratingsDetail"></div></div>' +
@@ -778,6 +778,19 @@
       : '–';
     el.innerHTML = '已评审 <b style="color:var(--ink)">' + st.cachedCount + '</b> / ' + fmtNum(works.length) +
       ' · 均值 ' + avg + ' 分' + (st.queued ? ' · 队列 ' + st.queued : '');
+    if (Cloud.getModelStatus) {
+      Cloud.getModelStatus().then(function (ms) {
+        var tag = $('modelTag');
+        if (!tag) return;
+        if (ms.pausedUntil) {
+          tag.textContent = '免费模型暂停中 · ' + fmtTime(ms.pausedUntil) + ' 恢复';
+          tag.style.color = 'var(--warn)';
+        } else {
+          tag.textContent = '模型 ' + (ms.model || '–') + (ms.night ? ' · 夜间 hy4 优先' : '');
+          tag.style.color = '';
+        }
+      }).catch(function () {});
+    }
     var btn = $('warmMoreBtn');
     if (btn) btn.addEventListener('click', function () { warmMore(30); toast('已加入队列，将逐件分析'); });
   }
@@ -1060,7 +1073,7 @@
       '<ul>' +
       '<li>后端：Node.js 原生 HTTP 服务（零第三方依赖），定时轮询 + 快照存储 + 静态托管</li>' +
       '<li>前端：原生 HTML / CSS / JS 多页面应用，hash 路由，手写 SVG 图表，无构建步骤</li>' +
-      '<li>云服务（WorkBuddy Cloud）：免密钥大模型调用（Step-5-Preview）生成作品分析，云数据库（PostgreSQL + RLS）持久化分析结果与社区互动数据</li>' +
+      '<li>云服务（WorkBuddy Cloud）：免密钥大模型调用（免费模型调度：白天 Step-5-Preview / 夜间 Hy4-Preview / Hy3 兜底，每批 6 件一次调用）生成作品分析，云数据库（PostgreSQL + RLS）持久化分析结果与社区互动数据</li>' +
       '</ul>' +
       '<h3>开源地址</h3>' +
       '<p>本项目代码已在 GitHub 开源（MIT 许可）：<a href="https://github.com/xiaojiaenen/wb1024-monitor" target="_blank" rel="noopener">github.com/xiaojiaenen/wb1024-monitor</a>。欢迎提交 Issue 与 PR；<code>design-demos/</code> 目录保留了三个设计方向的完整初稿与设计决策记录。</p>' +
