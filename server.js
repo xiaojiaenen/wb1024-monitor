@@ -59,6 +59,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 const SNAPSHOT_FILE = path.join(DATA_DIR, 'snapshot.json');
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const WORKS_FULL_FILE = path.join(DATA_DIR, 'works-full.json'); // 作品全量记录（含长文本/全部截图），供 /api/works 分页与 /api/work 详情
+const POOL_FULL_FILE = path.join(DATA_DIR, 'pool-full.json'); // 投稿池全量记录（含宣言/介绍/截图/体验链接），供 /api/submission 详情
 
 // ---------------------------------------------------------------- 工具
 
@@ -257,11 +258,43 @@ function slimPool(r) {
   };
 }
 
+/** 投稿池全量记录 —— /api/submission 详情用：保留宣言/介绍/截图/体验链接等长字段 */
+function richPool(r) {
+  return {
+    id: r._id || '',
+    sid: r['提交编号'] || '',
+    name: r['应用名称'] || '',
+    author: r['作者'] || '',
+    form: r['作品形态'] || '',
+    status: r['审核状态'] || '未知',
+    submittedAt: r['提交时间'] || '',
+    highlight: r['一句话亮点'] || '',
+    manifesto: r['我的作品宣言'] || '',
+    desc: r['原文描述'] || '',
+    link: Array.isArray(r['体验链接']) ? r['体验链接'] : null,
+    shots: (Array.isArray(r['作品截图']) ? r['作品截图'] : []).map((s) => ({
+      url: s.imageUrl || '',
+      title: s.title || ''
+    })),
+    tags: r['标签'] || '',
+    cardNo: typeof r['已上架卡片号'] === 'number' ? r['已上架卡片号'] : null,
+    platform: r['上传平台'] || ''
+  };
+}
+
+/** 轮询时顺手把全量投稿记录灌入内存缓存（快速轮询补最新、深度轮询补全池） */
+function capturePoolFull(rows) {
+  rows.forEach((r) => {
+    if (r && r._id) state.poolFull[r._id] = richPool(r);
+  });
+}
+
 // ---------------------------------------------------------------- 快照状态
 
 const state = {
   snapshot: null,
   worksFull: [], // 作品全量记录（内存缓存，/api/works 与 /api/work 的数据源）
+  poolFull: {}, // 投稿池全量记录（id -> 详情，/api/submission 的数据源）
   history: [],
   poller: {
     startedAt: new Date().toISOString(),
@@ -306,6 +339,17 @@ function loadPersisted() {
   } catch (e) {
     log('作品全量缓存损坏，忽略', e.message);
   }
+  try {
+    if (fs.existsSync(POOL_FULL_FILE)) {
+      const p = JSON.parse(fs.readFileSync(POOL_FULL_FILE, 'utf8'));
+      if (Array.isArray(p)) {
+        p.forEach((r) => { if (r && r.id) state.poolFull[r.id] = r; });
+        log('已载入投稿池全量缓存，记录数:', Object.keys(state.poolFull).length);
+      }
+    }
+  } catch (e) {
+    log('投稿池全量缓存损坏，忽略', e.message);
+  }
   /* 没有全量缓存时，用旧快照的瘦身作品顶号（缺长文本，首次轮询后会补齐） */
   if (!state.worksFull.length && state.snapshot && Array.isArray(state.snapshot.works)) {
     state.worksFull = state.snapshot.works;
@@ -323,6 +367,7 @@ async function fastPoll() {
 
   const works = wallRows.map(mapWork).filter((w) => w.name);
   const recent = recentRows.map(slimPool);
+  capturePoolFull(recentRows); // 最新 40 条的全量记录进缓存
 
   state.worksFull = works; // 全量进内存缓存（分页接口的数据源）
   atomicWriteJson(WORKS_FULL_FILE, works);
@@ -389,6 +434,8 @@ async function fastPoll() {
 async function deepPoll() {
   const poolRows = await queryAll(DB_POOL);
   const pool = poolRows.map(slimPool);
+  capturePoolFull(poolRows); // 全池全量记录进缓存
+  atomicWriteJson(POOL_FULL_FILE, Object.values(state.poolFull)); // 持久化，重启不丢
 
   const byStatus = {};
   pool.forEach((r) => {
@@ -613,6 +660,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 投稿池单条全量详情（含宣言/介绍/截图/体验链接）—— 动态页详情弹窗用
+  if (pathname === '/api/submission') {
+    const pid = u.searchParams.get('id') || '';
+    const found = state.poolFull[pid];
+    if (!found) {
+      sendJson(res, { error: 'not found' });
+      return;
+    }
+    sendJson(res, { submission: found });
+    return;
+  }
+
   // 调试端点：接收前端探针日志，追加落盘（仅本地开发排查用）
   if (pathname === '/_debug/log') {
     let body = '';
@@ -671,6 +730,7 @@ process.on('SIGTERM', () => {
   log('收到 SIGTERM，保存状态后退出');
   if (state.snapshot) atomicWriteJson(SNAPSHOT_FILE, state.snapshot);
   if (state.worksFull.length) atomicWriteJson(WORKS_FULL_FILE, state.worksFull);
+  if (Object.keys(state.poolFull).length) atomicWriteJson(POOL_FULL_FILE, Object.values(state.poolFull));
   atomicWriteJson(HISTORY_FILE, state.history);
   process.exit(0);
 });

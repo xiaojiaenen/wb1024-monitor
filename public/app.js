@@ -1492,6 +1492,14 @@
     document.body.style.overflow = '';
   }
 
+  /* 投稿详情：先用列表数据立即展示，再异步补全量（宣言/介绍/截图/体验链接） */
+  function openSubmissionModal(sub) {
+    paintSubmissionModal(sub);
+    apiGet('/api/submission', { id: sub.id }).then(function (res) {
+      if (res && res.submission && !$('modalMask').hidden) paintSubmissionFull(res.submission);
+    }).catch(function () { /* 补拉失败保持列表版 */ });
+  }
+
   /* 投稿池记录详情：未上架的投稿没有作品页，直接展示投稿信息 */
   function paintSubmissionModal(r) {
     var stMap = { '待审核': 'st-pending', '已通过': 'st-approved', '已驳回': 'st-rejected' };
@@ -1512,6 +1520,40 @@
       (r.status === '待审核' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿正在等待官方审核，通过后将出现在作品墙并获得卡片号。</p></div>' : '') +
       (r.status === '已驳回' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿未通过官方审核，未上架作品墙。</p></div>' : '');
     $('modalFoot').innerHTML = '';
+    $('modalMask').hidden = false;
+    document.body.style.overflow = 'hidden';
+  }
+
+  /* 投稿详情全量版：宣言 / 完整介绍 / 截图灯箱 / 体验链接 */
+  function paintSubmissionFull(r) {
+    var stMap = { '待审核': 'st-pending', '已通过': 'st-approved', '已驳回': 'st-rejected' };
+    var shots = (r.shots || []).map(function (s) {
+      return '<img class="m-shot" data-shot="' + esc(s.url) + '" src="' + esc(s.url) + '" alt="' + esc(s.title) + '" loading="lazy" decoding="async">';
+    }).join('');
+    var hl = r.highlight ? '<div class="m-sec"><h3>一句话亮点</h3><p>' + esc(r.highlight) + '</p></div>' : '';
+    var mf = r.manifesto && r.manifesto !== r.highlight
+      ? '<div class="m-sec"><h3>我的作品宣言</h3><p>' + esc(r.manifesto) + '</p></div>' : '';
+    $('modalBody').innerHTML =
+      '<div class="m-head">' +
+        '<span class="m-no">' + esc(r.sid || '投稿') + '</span>' +
+        '<div><div class="m-title">' + esc(r.name) + '</div>' +
+        '<div class="m-author">作者：' + esc(r.author) + ' · ' + esc(r.form || '–') + '</div></div>' +
+        '<button class="m-close" data-act="close" aria-label="关闭">✕</button>' +
+      '</div>' +
+      '<div class="m-chips">' +
+        '<span class="chip ' + (stMap[r.status] || '') + '">' + esc(r.status) + '</span>' +
+        (r.cardNo != null ? '<span class="chip">已上架 · 卡片号 #' + r.cardNo + '</span>' : '') +
+        (r.platform ? '<span class="chip">' + esc(r.platform) + '</span>' : '') +
+        (r.tags ? '<span class="chip">#' + esc(r.tags) + '</span>' : '') +
+      '</div>' +
+      hl + mf +
+      (r.desc ? '<div class="m-sec"><h3>作品介绍</h3><p>' + esc(r.desc) + '</p></div>' : '') +
+      (shots ? '<div class="m-sec"><h3>作品截图（' + (r.shots || []).length + '）· 点击看大图</h3><div class="m-shots">' + shots + '</div></div>' : '') +
+      (r.status === '待审核' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿正在等待官方审核，通过后将出现在作品墙并获得卡片号。</p></div>' : '') +
+      (r.status === '已驳回' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿未通过官方审核，未上架作品墙。</p></div>' : '');
+    $('modalFoot').innerHTML = (r.link && r.link[0] && r.link[0].link)
+      ? '<div class="m-links"><a class="link-btn" href="' + esc(r.link[0].link) + '" target="_blank" rel="noopener">打开体验链接 ↗</a></div>'
+      : '';
     $('modalMask').hidden = false;
     document.body.style.overflow = 'hidden';
   }
@@ -1722,7 +1764,7 @@
           (snapshot.works || []).forEach(function (w) { if (w.cardNo === sub.cardNo) fw = w; });
           if (fw) { openModal(fw.id); return; }
         }
-        paintSubmissionModal(sub);
+        openSubmissionModal(sub);
       }
       return;
     }
