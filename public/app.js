@@ -1076,7 +1076,7 @@
       '<li>云服务（WorkBuddy Cloud）：免密钥大模型调用（免费模型调度：白天 Step-5-Preview / 夜间 Hy4-Preview / Hy3 兜底，每批 6 件一次调用）生成作品分析，云数据库（PostgreSQL + RLS）持久化分析结果与社区互动数据</li>' +
       '</ul>' +
       '<h3>开源地址</h3>' +
-      '<p>本项目代码已在 GitHub 开源（MIT 许可）：<a href="https://github.com/xiaojiaenen/wb1024-monitor" target="_blank" rel="noopener">github.com/xiaojiaenen/wb1024-monitor</a>。欢迎提交 Issue 与 PR；<code>design-demos/</code> 目录保留了三个设计方向的完整初稿与设计决策记录。</p>' +
+      '<p>本项目代码已在 GitHub 开源（MIT 许可）：<a href="https://github.com/xiaojiaenen/wb1024-monitor" target="_blank" rel="noopener">github.com/xiaojiaenen/wb1024-monitor</a>。欢迎提交 Issue 与 PR。</p>' +
       '<h3>参赛信息</h3>' +
       '<p>WorkBuddy 1024 造物挑战 · 开发网站赛道。官方活动页：<a href="https://www.workbuddy.link/p/8QYARuAmZ9RgQty3FSzNUs" target="_blank" rel="noopener">workbuddy.link/p/8QYARuAmZ9RgQty3FSzNUs</a></p>' +
       '</div></div>';
