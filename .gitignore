@@ -1,0 +1,13 @@
+# 运行时数据（快照/历史/日志）不入库
+data/
+*.log
+
+# 依赖
+node_modules/
+
+# 系统杂物
+.DS_Store
+Thumbs.db
+
+# WorkBuddy 工作区数据
+.workbuddy/

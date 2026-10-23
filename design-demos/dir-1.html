@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>1024 造物挑战：赛事监控台 — 方向一：赛事识别</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #FBFAF7; --ink: #16130F; --signal: #C43A14; --hair: #E3E0D9; --muted: #6B655A;
+    --panel: #FBFAF7; --ok: #1F7A4D; --warn: #8F5400; --signal-text: #C43A14;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { background: var(--bg); color: var(--ink); font-family: Inter, "Noto Sans SC", sans-serif; font-size: 13px; overflow: hidden; }
+  .disp { font-family: Oswald, Inter, "Noto Sans SC", sans-serif; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ---------- 应用外壳 ---------- */
+  .app { display: flex; height: 100vh; }
+  .rail { width: 64px; background: var(--bg); border-right: 1px solid var(--hair); display: flex; flex-direction: column; align-items: center; padding-top: 10px; flex-shrink: 0; }
+  .rail .mark { width: 34px; height: 34px; background: var(--signal); display: flex; align-items: center; justify-content: center; margin-bottom: 14px; }
+  .rail .it { width: 48px; height: 52px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; font-size: 12px; color: var(--muted); letter-spacing: .08em; cursor: pointer; border: 1px solid transparent; margin-bottom: 4px; }
+  .rail .it.on { background: var(--ink); color: var(--bg); }
+  .rail .it:hover:not(.on) { border-color: var(--hair); color: var(--ink); }
+
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .band { height: 46px; background: var(--ink); color: var(--bg); display: flex; align-items: stretch; flex-shrink: 0; }
+  .band .logo { background: var(--signal); display: flex; align-items: center; padding: 0 18px; font-family: Oswald; font-weight: 600; font-size: 16px; letter-spacing: .04em; }
+  .band .cd { display: flex; align-items: center; padding: 0 16px; font-size: 12px; letter-spacing: .06em; color: #CFC9BC; }
+  .band .cd b { font-family: Oswald; font-size: 21px; font-weight: 600; color: var(--bg); margin: 0 6px; }
+  .band .sp { flex: 1; }
+  .band .live { display: flex; align-items: center; padding: 0 18px; font-size: 12px; letter-spacing: .1em; color: #CFC9BC; }
+  .band .dot { width: 8px; height: 8px; background: var(--signal); margin-right: 8px; animation: blink 1.6s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+
+  .notice { height: 30px; display: flex; align-items: center; gap: 8px; padding: 0 16px; font-size: 14px; color: #6E6759; background: #F4F1E9; border-bottom: 1px solid var(--hair); flex-shrink: 0; }
+  .notice .sq { width: 8px; height: 8px; background: var(--signal); flex-shrink: 0; }
+
+  .page { flex: 1; overflow: hidden; padding: 14px 18px; display: none; }
+  .page.on { display: flex; flex-direction: column; gap: 12px; }
+
+  /* ---------- KPI 条 ---------- */
+  .kpis { display: flex; border: 1px solid var(--ink); flex-shrink: 0; }
+  .kpi { flex: 1; padding: 9px 14px 8px; border-right: 1px solid var(--ink); display: flex; flex-direction: column; gap: 2px; }
+  .kpi:last-child { border-right: 0; }
+  .kpi .k { font-size: 12px; letter-spacing: .16em; color: var(--muted); }
+  .kpi .v { font-family: Oswald; font-size: 30px; font-weight: 600; line-height: 1; }
+  .kpi .v.hot { color: var(--signal); }
+  .kpi .s { font-size: 12px; color: var(--muted); }
+  .kpi .s b { color: var(--ok); font-weight: 600; }
+
+  /* ---------- 面板通用 ---------- */
+  .panel { border: 1px solid var(--hair); background: transparent; display: flex; flex-direction: column; min-height: 0; }
+  .panel-h { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--hair); flex-shrink: 0; }
+  .panel-h h2 { font-family: Oswald; font-size: 14px; font-weight: 500; letter-spacing: .12em; }
+  .panel-h .rule { flex: 1; height: 1px; background: var(--hair); }
+  .panel-h .meta { font-size: 12px; color: var(--muted); letter-spacing: .06em; }
+
+  .row2 { display: flex; gap: 12px; flex: 1; min-height: 0; }
+  .col-board { flex: 1.55; min-width: 0; }
+  .col-wall { flex: 1; min-width: 0; }
+
+  /* ---------- 结果榜 ---------- */
+  table.board { width: 100%; border-collapse: collapse; }
+  table.board tr { cursor: pointer; }
+  table.board tr:hover td { background: #F0EDE4; }
+  table.board tr.sel td { background: var(--ink); color: var(--bg); }
+  table.board tr.sel td .sub, table.board tr.sel td .no { color: #B9B2A2; }
+  table.board td { padding: 6.5px 12px; border-bottom: 1px solid var(--hair); vertical-align: middle; }
+  table.board .rk { width: 44px; font-family: Oswald; font-size: 19px; font-weight: 600; color: #6E685C; text-align: center; }
+  table.board .rk.top { color: var(--signal-text); }
+  table.board tr.sel .rk { color: var(--bg); }
+  table.board .nm { font-weight: 600; font-size: 13px; }
+  table.board .nm .no { font-weight: 400; font-size: 12px; color: var(--muted); margin-left: 7px; font-variant-numeric: tabular-nums; }
+  table.board .sub { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.board .sc { font-family: Oswald; font-size: 22px; font-weight: 600; text-align: right; width: 62px; }
+  table.board .sc small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  table.board tr.sel .sc small { color: #B9B2A2; }
+
+  /* ---------- 作品墙 ---------- */
+  .wall { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; overflow: auto; }
+  .wcard { border: 1px solid var(--hair); background: transparent; cursor: pointer; position: relative; }
+  .wcard:hover { border-color: var(--ink); }
+  .wcard .shot { height: 74px; background: #EDEAE2 center/cover no-repeat; position: relative; }
+  .wcard .shot .no { position: absolute; left: 0; top: 0; background: var(--ink); color: var(--bg); font-family: Oswald; font-size: 12px; padding: 2px 7px; letter-spacing: .04em; }
+  .wcard .shot .new { position: absolute; right: 0; top: 0; background: var(--signal); color: #fff; font-size: 12px; padding: 2px 7px; }
+  .wcard .info { padding: 6px 8px 7px; }
+  .wcard .info .nm { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wcard .info .au { font-size: 12px; color: var(--muted); margin-top: 1px; }
+
+  /* ---------- 流水 ---------- */
+  .ticker { display: flex; align-items: stretch; border: 1px solid var(--hair); background: transparent; flex-shrink: 0; height: 62px; overflow: hidden; }
+  .ticker .lb { display: flex; align-items: center; padding: 0 14px; background: var(--ink); color: var(--bg); font-family: Oswald; font-size: 12px; letter-spacing: .14em; flex-shrink: 0; }
+  .ticker .track { flex: 1; display: flex; align-items: center; padding: 0 6px; gap: 0; overflow: hidden; }
+  .tick-item { display: flex; align-items: center; gap: 9px; padding: 0 16px; border-right: 1px solid var(--hair); flex-shrink: 0; animation: slidein .5s; }
+  @keyframes slidein { from { transform: translateX(24px); opacity: 0; } }
+  .tick-item .nm { font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .tick-item .au { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .tick-item .st { font-size: 12px; padding: 1.5px 8px; border: 1px solid; letter-spacing: .08em; white-space: nowrap; }
+  .tick-item .st.p { color: var(--warn); border-color: var(--warn); }
+  .tick-item .st.a { color: var(--ok); border-color: var(--ok); }
+  .tick-item .t { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* ---------- 评审页 ---------- */
+  .detail { flex: 1.25; min-width: 0; }
+  .d-head { padding: 14px 16px 12px; border-bottom: 1px solid var(--hair); }
+  .d-head .no { font-family: Oswald; font-size: 12px; color: var(--signal-text); letter-spacing: .1em; }
+  .d-head h1 { font-family: Oswald; font-size: 26px; font-weight: 600; margin: 3px 0 4px; }
+  .d-head .au { font-size: 12px; } color: var(--muted); }
+  .d-head .au b { color: var(--ink); font-weight: 600; }
+  .d-total { display: flex; align-items: baseline; gap: 12px; padding: 12px 16px 4px; }
+  .d-total .v { font-family: Oswald; font-size: 52px; font-weight: 700; line-height: 1; }
+  .d-total .v small { font-size: 18px; color: var(--muted); font-weight: 400; }
+  .d-total .tag { font-size: 12px; letter-spacing: .14em; color: var(--muted); }
+  .bars { padding: 8px 16px 14px; display: flex; flex-direction: column; gap: 9px; }
+  .bar-row { display: grid; grid-template-columns: 76px 1fr 54px; align-items: center; gap: 10px; }
+  .bar-row .lb { font-size: 12px; color: var(--ink); letter-spacing: .04em; }
+  .bar-row .track { height: 14px; background: #F0EDE4; position: relative; }
+  .bar-row .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); }
+  .bar-row .fill.sig { background: var(--signal); }
+  .bar-row .val { font-family: Oswald; font-size: 16px; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+  .bar-row .val small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .d-sec { padding: 12px 16px; border-top: 1px solid var(--hair); }
+  .d-sec h3 { font-family: Oswald; font-size: 12px; font-weight: 500; letter-spacing: .16em; color: var(--muted); margin-bottom: 7px; }
+  .d-sec p { font-size: 14px; line-height: 1.65; }
+  .d-sec ul { list-style: none; }
+  .d-sec li { font-size: 14px; line-height: 1.6; padding-left: 14px; position: relative; margin-bottom: 3px; }
+  .d-sec li::before { content: ""; position: absolute; left: 0; top: 8px; width: 6px; height: 6px; background: var(--signal); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chips span { font-size: 12px; border: 1px solid var(--hair); padding: 2px 9px; background: #FAF8F2; color: #55504A; }
+  .reasons { display: flex; flex-direction: column; gap: 7px; }
+  .reason { font-size: 11.5px; line-height: 1.6; color: #4A453C; }
+  .reason b { color: var(--ink); font-weight: 600; }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #D8D3C6; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="rail">
+    <div class="mark">
+      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="#FBFAF7" stroke-width="1.6"><circle cx="10" cy="10" r="7.5"/><path d="M10 5.5l1.7 3.6 3.9.5-2.8 2.7.7 3.9-3.5-1.9-3.5 1.9.7-3.9-2.8-2.7 3.9-.5z"/></svg>
+    </div>
+    <div class="it on" data-page="overview">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="6.4"/><path d="M8 1.6v12.8M1.6 8h12.8"/></svg>总览
+    </div>
+    <div class="it" data-page="works">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1.6" y="1.6" width="5.4" height="5.4"/><rect x="9" y="1.6" width="5.4" height="5.4"/><rect x="1.6" y="9" width="5.4" height="5.4"/><rect x="9" y="9" width="5.4" height="5.4"/></svg>作品
+    </div>
+    <div class="it" data-page="ratings">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3 14.4h10M4.6 14.4V9.2M8 14.4V4.4M11.4 14.4V6.8"/></svg>评审
+    </div>
+    <div class="it">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.6 13.6L5.6 8l3.2 2.6L14.4 3.6"/><path d="M14.4 3.6h-3.4M14.4 3.6v3.4"/></svg>洞察
+    </div>
+    <div class="it">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.6 8h2.8l1.8-4.6 2.6 9.2 1.8-4.6h3.6"/></svg>动态
+    </div>
+  </nav>
+
+  <div class="main">
+    <header class="band">
+      <div class="logo">1024 造物挑战</div>
+      <div class="cd">投稿截止<b id="cd-days">D-9</b></div>
+      <div class="sp"></div>
+      <div class="live"><span class="dot"></span><span id="clock">LIVE 实时同步中</span></div>
+    </header>
+    <div class="notice"><span class="sq"></span>社区非官方监控台，数据取自官方公开页面；若官方调整页面结构可能导致数据中断，届时以官方页面为准</div>
+
+    <!-- ============ 总览 ============ -->
+    <section class="page on" id="page-overview">
+      <div class="kpis" id="kpis"></div>
+      <div class="row2">
+        <div class="panel col-board">
+          <div class="panel-h"><h2>AI 评审结果榜</h2><div class="rule"></div><span class="meta">按官方细则评分：创意35 / 完成度40 / 体验25，点击行查看评审依据</span></div>
+          <div style="overflow:auto"><table class="board" id="board"></table></div>
+        </div>
+        <div class="panel col-wall">
+          <div class="panel-h"><h2>最新上架</h2><div class="rule"></div><span class="meta">作品墙实时</span></div>
+          <div class="wall" id="wall"></div>
+        </div>
+      </div>
+      <div class="ticker">
+        <div class="lb">实时流水</div>
+        <div class="track" id="ticker"></div>
+      </div>
+    </section>
+
+    <!-- ============ AI 评审 ============ -->
+    <section class="page" id="page-ratings">
+      <div class="row2">
+        <div class="panel" style="flex:1;min-width:0">
+          <div class="panel-h"><h2>评审排行</h2><div class="rule"></div><span class="meta" id="ratings-count"></span></div>
+          <div style="overflow:auto"><table class="board" id="board-full"></table></div>
+        </div>
+        <div class="panel detail" id="detail"></div>
+      </div>
+    </section>
+
+    <!-- ============ 作品库 ============ -->
+    <section class="page" id="page-works">
+      <div class="panel" style="flex:1">
+        <div class="panel-h"><h2>作品库</h2><div class="rule"></div><span class="meta" id="works-count"></span></div>
+        <div class="wall" id="wall-full" style="grid-template-columns:repeat(4,1fr)"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script src="data.js"></script>
+<script>
+(function () {
+  var D = window.DEMO_DATA;
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---------- 倒计时 ---------- */
+  var end = new Date('2026-11-01T23:59:59+08:00').getTime();
+  var days = Math.max(0, Math.ceil((end - Date.now()) / 86400000));
+  $('cd-days').textContent = 'D-' + days;
+
+  /* ---------- 时钟 ---------- */
+  function pad(n) { return String(n).padStart(2, '0'); }
+  setInterval(function () {
+    var d = new Date();
+    $('clock').textContent = 'LIVE ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + ' 同步间隔 60s';
+  }, 1000);
+
+  /* ---------- 数据 ---------- */
+  var analyses = D.analyses.slice().sort(function (a, b) { return b.total - a.total; });
+  var works = D.latestWorks;
+  var recent = D.recent;
+
+  /* ---------- KPI ---------- */
+  var kpiDefs = [
+    { k: '已上架作品', v: D.stats.wallTotal, s: '网页 ' + D.stats.webApps + ' / 小程序 ' + D.stats.miniApps },
+    { k: '今日投稿', v: '+' + D.stats.newToday, s: '较昨日同期 <b>持续走高</b>', hot: true },
+    { k: '投稿总量', v: D.stats.poolTotal.toLocaleString(), s: '上架率 23.1%' },
+    { k: '待审核', v: D.stats.poolPending.toLocaleString(), s: '已通过 ' + D.stats.poolApproved + ' / 已驳回 ' + D.stats.poolRejected }
+  ];
+  $('kpis').innerHTML = kpiDefs.map(function (x) {
+    return '<div class="kpi"><span class="k">' + x.k + '</span><span class="v num' + (x.hot ? ' hot' : '') + '">' + x.v + '</span><span class="s">' + x.s + '</span></div>';
+  }).join('');
+
+  /* ---------- 结果榜 ---------- */
+  function boardRow(a, i) {
+    return '<tr data-id="' + a.id + '"' + (i === 0 ? ' class="sel"' : '') + '>' +
+      '<td class="rk' + (i < 3 ? ' top' : '') + '">' + (i + 1) + '</td>' +
+      '<td><div class="nm">' + a.name + '<span class="no">#' + a.id + '</span></div></td>' +
+      '<td class="sub">' + a.creativity + ' / ' + a.completeness + ' / ' + a.experience + '</td>' +
+      '<td class="sc num">' + a.total + '<small> /100</small></td></tr>';
+  }
+  $('board').innerHTML = analyses.slice(0, 8).map(boardRow).join('');
+  $('board-full').innerHTML = analyses.map(boardRow).join('');
+  $('ratings-count').textContent = '已评审 ' + analyses.length + ' 件，均值 ' + (analyses.reduce(function (s, a) { return s + a.total; }, 0) / analyses.length).toFixed(1) + ' 分';
+
+  /* ---------- 作品墙 ---------- */
+  function wcard(w, isNew) {
+    return '<div class="wcard" data-id="' + w.id + '">' +
+      '<div class="shot" style="background-image:url(' + w.shot + ')"><span class="no">#' + w.cardNo + '</span>' + (isNew ? '<span class="new">NEW</span>' : '') + '</div>' +
+      '<div class="info"><div class="nm">' + w.name + '</div><div class="au">' + w.author + ' / ' + w.form + '</div></div></div>';
+  }
+  $('wall').innerHTML = works.slice(0, 6).map(function (w, i) { return wcard(w, i < 2); }).join('');
+  $('wall-full').innerHTML = works.map(function (w, i) { return wcard(w, i < 2); }).join('');
+  $('works-count').textContent = '已上架 ' + D.stats.wallTotal + ' 件，展示最新 ' + works.length + ' 件';
+
+  /* ---------- 流水 ---------- */
+  var tickIdx = 0;
+  function renderTicker() {
+    var items = [];
+    for (var i = 0; i < 4; i++) {
+      var r = recent[(tickIdx + i) % recent.length];
+      var cls = r.status === '待审核' ? 'p' : 'a';
+      items.push('<div class="tick-item"><span class="nm">' + r.name + '</span><span class="au">' + r.author + '</span><span class="st ' + cls + '">' + r.status + '</span><span class="t">' + r.submittedAt.slice(11) + '</span></div>');
+    }
+    $('ticker').innerHTML = items.join('');
+    tickIdx = (tickIdx + 1) % recent.length;
+  }
+  renderTicker();
+  setInterval(renderTicker, 4000);
+
+  /* ---------- 评审详情 ---------- */
+  function renderDetail(a) {
+    var bars = [
+      { lb: '创意与场景', v: a.creativity, max: 35 },
+      { lb: '作品完成度', v: a.completeness, max: 40 },
+      { lb: '使用体验', v: a.experience, max: 25 }
+    ];
+    $('detail').innerHTML =
+      '<div class="d-head"><div class="num">#' + a.id + ' / ' + (works.filter(function (w) { return String(w.cardNo) === String(a.id); })[0] || {}).form + '</div>' +
+      '<h1>' + a.name + '</h1>' +
+      '<div class="au">作者 <b>' + (works.filter(function (w) { return String(w.cardNo) === String(a.id); })[0] || {}).author + '</b>，' + (works.filter(function (w) { return String(w.cardNo) === String(a.id); })[0] || {}).form + '</div>' +
+      '<div class="au meta">AI 评审 glm-5.3-flash，对齐官方评审细则</div></div>' +
+      '<div class="d-total"><span class="v num">' + a.total + '<small> /100</small></span><span class="tag">创意35 / 完成度40 / 体验25</span></div>' +
+      '<div class="bars">' + bars.map(function (b) {
+        var pct = Math.round(b.v / b.max * 100);
+        return '<div class="bar-row"><span class="lb">' + b.lb + '</span><div class="track"><div class="fill' + (b.v / b.max >= 0.75 ? ' sig' : '') + '" style="width:' + pct + '%"></div></div><span class="val num">' + b.v + '<small>/' + b.max + '</small></span></div>';
+      }).join('') + '</div>' +
+      '<div class="d-sec"><h3>一句话总结</h3><p>' + a.summary + '</p></div>' +
+      '<div class="d-sec"><h3>评审亮点</h3><ul>' + a.highlights.map(function (h) { return '<li>' + h + '</li>'; }).join('') + '</ul></div>' +
+      '<div class="d-sec"><h3>推断技术栈</h3><div class="chips">' + a.tech.map(function (t) { return '<span>' + t + '</span>'; }).join('') + '</div></div>';
+  }
+  renderDetail(analyses[0]);
+
+  /* ---------- 页面切换 ---------- */
+  function showPage(name) {
+    document.querySelectorAll('.rail .it').forEach(function (x) { x.classList.toggle('on', x.dataset.page === name); });
+    document.querySelectorAll('.page').forEach(function (p) { p.classList.remove('on'); });
+    var el = $('page-' + name);
+    if (el) el.classList.add('on');
+  }
+  var railItems = document.querySelectorAll('.rail .it[data-page]');
+  railItems.forEach(function (it) {
+    it.addEventListener('click', function () { showPage(it.dataset.page); });
+  });
+  showPage((location.hash || '').replace('#', '') || 'overview');
+
+  /* ---------- 榜单行选择 ---------- */
+  document.querySelectorAll('table.board tr').forEach(function (tr) {
+    tr.addEventListener('click', function () {
+      var id = tr.dataset.id;
+      var a = analyses.filter(function (x) { return String(x.id) === String(id); })[0];
+      if (!a) return;
+      document.querySelectorAll('table.board tr').forEach(function (x) { x.classList.remove('sel'); });
+      document.querySelectorAll('table.board tr[data-id="' + id + '"]').forEach(function (x) { x.classList.add('sel'); });
+      renderDetail(a);
+      /* 跳到评审页 */
+      showPage('ratings');
+    });
+  });
+})();
+</script>
+</body>
+</html>

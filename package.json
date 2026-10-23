@@ -1,0 +1,13 @@
+{
+  "name": "wb1024-works-monitor",
+  "version": "1.0.0",
+  "description": "WorkBuddy 1024 造物挑战 · 作品监控台 — 实时监控大赛作品墙与投稿池数据",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
