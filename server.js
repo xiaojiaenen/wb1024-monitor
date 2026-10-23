@@ -263,6 +263,7 @@ function dbRowSubmission(r) {
   return {
     id: r.id, sid: r.sid || '', name: r.name || '', author: r.author || '',
     form: r.form || '', status: r.status || '未知', submitted_at: r.submittedAt || '',
+    reviewed_at: r.reviewedAt || '', reject_reason: r.rejectReason || '',
     highlight: r.highlight || '', manifesto: r.manifesto || '', description: r.desc || '',
     link: r.link || null, shots: r.shots || [], tags: r.tags || '',
     card_no: r.cardNo == null ? null : r.cardNo, platform: r.platform || ''
@@ -281,6 +282,7 @@ function dbRowToSubmission(row) {
   return {
     id: row.id, sid: row.sid || '', name: row.name || '', author: row.author || '',
     form: row.form || '', status: row.status || '未知', submittedAt: row.submitted_at || '',
+    reviewedAt: row.reviewed_at || '', rejectReason: row.reject_reason || '',
     highlight: row.highlight || '', manifesto: row.manifesto || '', desc: row.description || '',
     link: row.link || null, shots: row.shots || [], tags: row.tags || '',
     cardNo: row.card_no == null ? null : row.card_no, platform: row.platform || ''
@@ -413,6 +415,8 @@ function richPool(r) {
     form: r['作品形态'] || '',
     status: r['审核状态'] || '未知',
     submittedAt: r['提交时间'] || '',
+    reviewedAt: r['审核时间'] || '',
+    rejectReason: r['驳回原因'] || '',
     highlight: r['一句话亮点'] || '',
     manifesto: r['我的作品宣言'] || '',
     desc: r['原文描述'] || '',
@@ -513,7 +517,7 @@ async function hydrateFromDb() {
       log('云库 hydration 作品:', works.length, '条，内存合计:', state.worksFull.length);
     }
     const subs = await dbSelectAll('submissions',
-      ['id', 'sid', 'name', 'author', 'form', 'status', 'submitted_at', 'highlight', 'manifesto', 'description', 'link', 'shots', 'tags', 'card_no', 'platform']);
+      ['id', 'sid', 'name', 'author', 'form', 'status', 'submitted_at', 'reviewed_at', 'reject_reason', 'highlight', 'manifesto', 'description', 'link', 'shots', 'tags', 'card_no', 'platform']);
     if (subs.length) {
       subs.forEach((row) => {
         const r = dbRowToSubmission(row);
@@ -942,7 +946,8 @@ const server = http.createServer((req, res) => {
       submissions: sorted.slice(start, start + per).map((r) => ({
         id: r.id, sid: r.sid, name: r.name, author: r.author, form: r.form,
         status: r.status, submittedAt: r.submittedAt, highlight: r.highlight,
-        cardNo: r.cardNo, platform: r.platform
+        cardNo: r.cardNo, platform: r.platform,
+        rejectReason: r.rejectReason || '', reviewedAt: r.reviewedAt || ''
       }))
     });
     return;

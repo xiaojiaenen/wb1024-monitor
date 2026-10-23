@@ -1565,6 +1565,7 @@
         (r.platform ? '<span class="chip">' + esc(r.platform) + '</span>' : '') +
       '</div>' +
       (r.highlight ? '<div class="m-sec"><h3>一句话亮点</h3><p>' + esc(r.highlight) + '</p></div>' : '') +
+      (r.rejectReason ? '<div class="m-sec"><h3>驳回原因（官方）</h3><p style="color:var(--warn,#d4795c)">' + esc(r.rejectReason) + '</p>' + (r.reviewedAt ? '<p style="font-size:12px;color:var(--muted)">审核时间：' + esc(r.reviewedAt) + '</p>' : '') + '</div>' : '') +
       '<div class="m-sec"><h3>投稿信息</h3><p>提交时间：' + esc((r.submittedAt || '').slice(0, 19)) + '</p></div>' +
       (r.status === '待审核' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿正在等待官方审核，通过后将出现在作品墙并获得卡片号。</p></div>' : '') +
       (r.status === '已驳回' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿未通过官方审核，未上架作品墙。</p></div>' : '');
@@ -1596,10 +1597,11 @@
         (r.tags ? '<span class="chip">#' + esc(r.tags) + '</span>' : '') +
       '</div>' +
       hl + mf +
+      (r.rejectReason ? '<div class="m-sec"><h3>驳回原因（官方）</h3><p style="color:var(--warn,#d4795c)">' + esc(r.rejectReason) + '</p>' + (r.reviewedAt ? '<p style="font-size:12px;color:var(--muted)">审核时间：' + esc(r.reviewedAt) + '</p>' : '') + '</div>' : '') +
       (r.desc ? '<div class="m-sec"><h3>作品介绍</h3><p>' + esc(r.desc) + '</p></div>' : '') +
       (shots ? '<div class="m-sec"><h3>作品截图（' + (r.shots || []).length + '）· 点击看大图</h3><div class="m-shots">' + shots + '</div></div>' : '') +
       (r.status === '待审核' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿正在等待官方审核，通过后将出现在作品墙并获得卡片号。</p></div>' : '') +
-      (r.status === '已驳回' ? '<div class="m-sec"><p style="color:var(--muted)">该投稿未通过官方审核，未上架作品墙。</p></div>' : '');
+      (r.status === '已驳回' && !r.rejectReason ? '<div class="m-sec"><p style="color:var(--muted)">该投稿未通过官方审核，未上架作品墙。</p></div>' : '');
     $('modalFoot').innerHTML = (r.link && r.link[0] && r.link[0].link)
       ? '<div class="m-links"><a class="link-btn" href="' + esc(r.link[0].link) + '" target="_blank" rel="noopener">打开体验链接 ↗</a></div>'
       : '';
