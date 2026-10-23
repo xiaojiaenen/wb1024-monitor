@@ -14,3 +14,6 @@ Thumbs.db
 
 # 设计探索过程产物（三方向初稿/截图/修复脚本）不入库
 design-demos/
+
+# 调试产物（DOM dump / 截图）不入库
+*.tmp
